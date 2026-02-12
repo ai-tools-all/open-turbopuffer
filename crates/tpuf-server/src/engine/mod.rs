@@ -1,4 +1,5 @@
 pub mod batcher;
+pub mod index;
 pub mod namespace;
 pub mod search;
 
