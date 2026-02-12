@@ -66,6 +66,12 @@ impl PostingStore for MemoryPostingStore {
     }
 }
 
+impl MemoryPostingStore {
+    pub fn all_postings(&self) -> Vec<(u32, PostingList)> {
+        self.data.read().unwrap().iter().map(|(&id, pl)| (id, pl.clone())).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

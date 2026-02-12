@@ -368,6 +368,120 @@ mod integration_tests {
         );
     }
 
+    fn count_replica_placements(
+        idx: &SPFreshIndex,
+        vids: &[u64],
+    ) -> Vec<(u64, usize)> {
+        let all_postings = idx.posting_store.all_postings();
+        let vm = idx.version_map.read().unwrap();
+        vids.iter()
+            .map(|&vid| {
+                let ver = vm.get_version(vid);
+                let count = all_postings
+                    .iter()
+                    .filter(|(_, pl)| {
+                        pl.entries.iter().any(|e| e.vector_id == vid && e.version == ver)
+                    })
+                    .count();
+                (vid, count)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_replica_placement_exact_without_rng_filter() {
+        // With rng_factor=0 (no diversity filtering), every vector should land
+        // in exactly `replica_count` postings when enough centroids exist.
+        let dims = 8;
+        let replica_count = 3;
+        let config = SPFreshConfig {
+            dimensions: dims,
+            num_search_heads: 32,
+            max_posting_size: 8,
+            replica_count,
+            rng_factor: 0.0,
+            reassign_range: 32,
+            distance_metric: DistanceMetric::EuclideanSquared,
+            ..Default::default()
+        };
+        let idx = SPFreshIndex::new(config);
+
+        let seed_vecs = generate_seeded_vectors(100, dims, 77);
+        for (i, v) in seed_vecs.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+
+        let num_centroids = idx.head_index.read().unwrap().len();
+        println!("replica_exact: {num_centroids} centroids");
+        assert!(num_centroids >= replica_count);
+
+        let test_start = 100u64;
+        let test_vecs = generate_seeded_vectors(20, dims, 999);
+        for (i, v) in test_vecs.iter().enumerate() {
+            idx.insert(test_start + i as u64, v).unwrap();
+        }
+
+        let vids: Vec<u64> = (test_start..test_start + 20).collect();
+        let placements = count_replica_placements(&idx, &vids);
+
+        for &(vid, count) in &placements {
+            assert_eq!(
+                count, replica_count,
+                "vid={vid}: expected {replica_count} placements, got {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_replica_placement_no_data_loss_with_rng_filter() {
+        // With default rng_factor, RNG diversity filtering may reduce placement
+        // count below replica_count. But no vector should have 0 placements.
+        let dims = 8;
+        let replica_count = 3;
+        let config = SPFreshConfig {
+            dimensions: dims,
+            num_search_heads: 32,
+            max_posting_size: 8,
+            replica_count,
+            rng_factor: 2.0,
+            reassign_range: 32,
+            distance_metric: DistanceMetric::EuclideanSquared,
+            ..Default::default()
+        };
+        let idx = SPFreshIndex::new(config);
+
+        let seed_vecs = generate_seeded_vectors(100, dims, 77);
+        for (i, v) in seed_vecs.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+
+        let num_centroids = idx.head_index.read().unwrap().len();
+        println!("replica_rng: {num_centroids} centroids");
+        assert!(num_centroids >= replica_count);
+
+        let test_start = 100u64;
+        let test_vecs = generate_seeded_vectors(30, dims, 999);
+        for (i, v) in test_vecs.iter().enumerate() {
+            idx.insert(test_start + i as u64, v).unwrap();
+        }
+
+        let vids: Vec<u64> = (test_start..test_start + 30).collect();
+        let placements = count_replica_placements(&idx, &vids);
+        let counts: Vec<usize> = placements.iter().map(|&(_, c)| c).collect();
+
+        println!("replica_rng: placement counts={counts:?}");
+
+        for &(vid, count) in &placements {
+            assert!(
+                count >= 1,
+                "vid={vid} has 0 placements — data loss!"
+            );
+        }
+
+        let avg = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        println!("replica_rng: avg placements={avg:.2} (target={replica_count})");
+    }
+
     #[test]
     fn test_concurrent_insert_and_search() {
         use std::sync::Arc;
