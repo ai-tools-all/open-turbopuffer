@@ -1,1 +1,4 @@
 target/
+.beads/beads.db
+.beads/docs/
+docs/SPFresh-ref/
