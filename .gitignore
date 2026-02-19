@@ -1,5 +1,6 @@
 target/
 .env
-.beads/beads.db
 .beads/docs/
 docs/SPFresh-ref/
+.specstory/
+.beads/
