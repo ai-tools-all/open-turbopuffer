@@ -5,3 +5,4 @@ docs/SPFresh-ref/
 .specstory/
 .beads/
 .env.local.*
+.doc-manager-cli/
