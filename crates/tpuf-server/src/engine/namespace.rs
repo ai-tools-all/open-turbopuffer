@@ -527,7 +527,7 @@ pub struct QueryResult {
     pub attributes: HashMap<String, AttributeValue>,
 }
 
-fn replay_into_index(index: &mut SPFreshIndex, entry: &WalEntry) {
+pub fn replay_into_index(index: &mut SPFreshIndex, entry: &WalEntry) {
     for op in &entry.operations {
         match op {
             WriteOp::Upsert(docs) => {
@@ -546,7 +546,7 @@ fn replay_into_index(index: &mut SPFreshIndex, entry: &WalEntry) {
     }
 }
 
-pub(crate) fn apply_wal_entry(
+pub fn apply_wal_entry(
     documents: &mut HashMap<u64, Document>,
     doc_sequences: &mut HashMap<u64, u64>,
     entry: &WalEntry,

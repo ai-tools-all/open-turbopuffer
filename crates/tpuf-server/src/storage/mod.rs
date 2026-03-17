@@ -22,7 +22,7 @@ pub enum StorageError {
 }
 
 impl ObjectStore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn in_memory() -> Self {
         let op = Operator::new(opendal::services::Memory::default()).unwrap().finish();
         Self { op: Arc::new(op) }

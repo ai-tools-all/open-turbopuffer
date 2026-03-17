@@ -1,10 +1,6 @@
-mod api;
-mod engine;
-mod storage;
-mod types;
-
 use std::sync::Arc;
 use tracing::info;
+use tpuf_server::{api, engine, storage};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
