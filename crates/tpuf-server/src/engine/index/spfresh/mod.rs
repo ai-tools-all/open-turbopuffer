@@ -9,11 +9,11 @@ pub mod updater;
 pub mod rebuilder;
 
 pub use config::SPFreshConfig;
-pub use version_map::VersionMap;
+pub use version_map::{VersionMap, VersionMapFile};
 pub use kmeans::{KMeansResult, binary_kmeans};
 pub use posting::{PostingEntry, PostingList};
 pub use posting_store::{PostingStore, MemoryPostingStore};
-pub use head_index::HeadIndex;
+pub use head_index::{HeadIndex, CentroidsFile};
 
 use std::sync::{RwLock, atomic::{AtomicUsize, Ordering}};
 
@@ -35,6 +35,38 @@ impl SPFreshIndex {
             version_map: RwLock::new(VersionMap::new(1024)),
             vector_count: AtomicUsize::new(0),
         }
+    }
+
+    pub fn from_parts(
+        config: SPFreshConfig,
+        head_index: HeadIndex,
+        posting_store: MemoryPostingStore,
+        version_map: VersionMap,
+        vector_count: usize,
+    ) -> Self {
+        Self {
+            config,
+            head_index: RwLock::new(head_index),
+            posting_store,
+            version_map: RwLock::new(version_map),
+            vector_count: AtomicUsize::new(vector_count),
+        }
+    }
+
+    pub fn config(&self) -> &SPFreshConfig {
+        &self.config
+    }
+
+    pub fn head_index(&self) -> &RwLock<HeadIndex> {
+        &self.head_index
+    }
+
+    pub fn posting_store(&self) -> &MemoryPostingStore {
+        &self.posting_store
+    }
+
+    pub fn version_map(&self) -> &RwLock<VersionMap> {
+        &self.version_map
     }
 
     pub fn process_pending_splits(&self, oversized: &[u32]) {

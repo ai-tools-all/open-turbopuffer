@@ -1,7 +1,14 @@
 use std::sync::atomic::{AtomicU8, Ordering};
+use serde::{Serialize, Deserialize};
 
 const DELETED_BIT: u8 = 0x80;
 const VERSION_MASK: u8 = 0x7F;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VersionMapFile {
+    pub capacity: usize,
+    pub data: Vec<u8>,
+}
 
 pub struct VersionMap {
     versions: Vec<AtomicU8>,
@@ -75,6 +82,23 @@ impl VersionMap {
                 Err(_) => continue,
             }
         }
+    }
+
+    pub fn to_file(&self) -> VersionMapFile {
+        let data: Vec<u8> = self.versions.iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        VersionMapFile {
+            capacity: data.len(),
+            data,
+        }
+    }
+
+    pub fn from_file(file: VersionMapFile) -> Self {
+        let versions = file.data.into_iter()
+            .map(|b| AtomicU8::new(b))
+            .collect();
+        Self { versions }
     }
 }
 
@@ -151,5 +175,27 @@ mod tests {
         let expected = if expected == 0 { 127 } else { expected };
         // With wrapping: (801 % 127) = 801 - 6*127 = 801 - 762 = 39
         assert_eq!(ver, expected);
+    }
+
+    #[test]
+    fn test_version_map_roundtrip() {
+        let mut vm = VersionMap::new(5);
+        vm.ensure_capacity(10);
+        vm.initialize(0);
+        vm.initialize(3);
+        vm.initialize(7);
+        vm.increment_version(3);
+        vm.mark_deleted(7);
+
+        let file = vm.to_file();
+        let bytes = bincode::serialize(&file).unwrap();
+        let decoded: VersionMapFile = bincode::deserialize(&bytes).unwrap();
+        let restored = VersionMap::from_file(decoded);
+
+        assert_eq!(restored.get_version(0), 1);
+        assert_eq!(restored.get_version(3), 2);
+        assert!(restored.is_deleted(7));
+        assert!(!restored.is_deleted(0));
+        assert_eq!(restored.get_version(5), 0);
     }
 }

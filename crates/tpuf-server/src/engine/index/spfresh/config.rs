@@ -1,6 +1,7 @@
+use serde::{Serialize, Deserialize};
 use crate::types::DistanceMetric;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SPFreshConfig {
     pub max_posting_size: usize,
     pub min_posting_size: usize,
