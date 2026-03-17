@@ -444,6 +444,12 @@ impl NamespaceManager {
                 .collect();
 
             if tail_vectors.is_empty() {
+                info!(
+                    namespace = %ns,
+                    ann_hits = ann_results.len(),
+                    tail_size = 0,
+                    "query: index only (no tail)"
+                );
                 ann_results
             } else {
                 let tail_ids: std::collections::HashSet<u64> =
@@ -452,7 +458,26 @@ impl NamespaceManager {
                     .filter(|(id, _)| !tail_ids.contains(id))
                     .collect();
                 let tail_results = brute_force_knn(&vector, &tail_vectors, metric, top_k);
-                merge_top_k(&ann_filtered, &tail_results, top_k)
+                let merged = merge_top_k(&ann_filtered, &tail_results, top_k);
+
+                let from_ann: Vec<u64> = merged.iter()
+                    .filter(|(id, _)| !tail_ids.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                let from_tail: Vec<u64> = merged.iter()
+                    .filter(|(id, _)| tail_ids.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                info!(
+                    namespace = %ns,
+                    tail_size = tail_vectors.len(),
+                    from_index = from_ann.len(),
+                    from_tail = from_tail.len(),
+                    index_ids = ?from_ann,
+                    tail_ids = ?from_tail,
+                    "query: hybrid (ANN + brute-force tail)"
+                );
+                merged
             }
         } else {
             let vectors: Vec<(u64, &[f32])> = state.documents.iter()
@@ -460,6 +485,11 @@ impl NamespaceManager {
                     doc.vector.as_ref().map(|v| (*id, v.as_slice()))
                 })
                 .collect();
+            info!(
+                namespace = %ns,
+                brute_force_size = vectors.len(),
+                "query: full brute-force (no index)"
+            );
             brute_force_knn(&vector, &vectors, metric, top_k)
         };
 
