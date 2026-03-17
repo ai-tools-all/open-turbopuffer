@@ -348,23 +348,32 @@ impl NamespaceManager {
 
         let metric = distance_metric.unwrap_or(state.metadata.distance_metric);
 
-        let vectors: Vec<(u64, &[f32])> = state.documents.iter()
-            .filter_map(|(id, doc)| {
-                doc.vector.as_ref().map(|v| (*id, v.as_slice()))
+        let scored = if let Some(index) = &state.index {
+            if index.len() > 0 {
+                index.search(&vector, top_k)
+                    .map_err(|e| EngineError::Validation(e.to_string()))?
+            } else {
+                Vec::new()
+            }
+        } else {
+            let vectors: Vec<(u64, &[f32])> = state.documents.iter()
+                .filter_map(|(id, doc)| {
+                    doc.vector.as_ref().map(|v| (*id, v.as_slice()))
+                })
+                .collect();
+            brute_force_knn(&vector, &vectors, metric, top_k)
+        };
+
+        let query_results: Vec<QueryResult> = scored.into_iter()
+            .filter_map(|(id, dist)| {
+                state.documents.get(&id).map(|doc| QueryResult {
+                    id,
+                    dist,
+                    vector: if include_vectors { doc.vector.clone() } else { None },
+                    attributes: doc.attributes.clone(),
+                })
             })
             .collect();
-
-        let results = brute_force_knn(&vector, &vectors, metric, top_k);
-
-        let query_results: Vec<QueryResult> = results.into_iter().map(|(id, dist)| {
-            let doc = state.documents.get(&id).unwrap();
-            QueryResult {
-                id,
-                dist,
-                vector: if include_vectors { doc.vector.clone() } else { None },
-                attributes: doc.attributes.clone(),
-            }
-        }).collect();
 
         Ok(query_results)
     }
@@ -450,5 +459,42 @@ mod tests {
 
         let idx_len = mgr.index_len("test").await.unwrap();
         assert_eq!(idx_len, 50, "index should have 50 vectors after deleting 50, got {idx_len}");
+    }
+
+    #[tokio::test]
+    async fn test_query_uses_index() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 200, 32);
+        let query_vec = docs[0].vector.clone().unwrap();
+        mgr.upsert("test", docs).await.unwrap();
+
+        let results = mgr.query("test", query_vec, 10, None, false).await.unwrap();
+        assert!(!results.is_empty(), "query should return results");
+        assert_eq!(results[0].id, 0, "nearest neighbor of doc 0 should be doc 0 itself");
+    }
+
+    #[tokio::test]
+    async fn test_query_deleted_not_returned() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 100, 32);
+        let query_vec = docs[0].vector.clone().unwrap();
+        mgr.upsert("test", docs).await.unwrap();
+
+        mgr.delete_docs("test", vec![0]).await.unwrap();
+
+        let results = mgr.query("test", query_vec, 10, None, false).await.unwrap();
+        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&0), "deleted doc 0 should not appear in results");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_to_brute_force_empty() {
+        let store = crate::storage::ObjectStore::in_memory();
+        let mgr = NamespaceManager::new(store);
+        mgr.create_namespace("empty".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+
+        let q = vec![0.0f32; 32];
+        let results = mgr.query("empty", q, 10, None, false).await.unwrap();
+        assert!(results.is_empty(), "empty namespace should return no results");
     }
 }

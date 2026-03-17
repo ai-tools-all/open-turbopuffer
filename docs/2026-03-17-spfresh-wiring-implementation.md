@@ -23,10 +23,12 @@ This covers Steps 1-3 from the parent design doc (in-memory only, no S3 persiste
 - [x] Test: `test_delete_removes_from_index` — upsert 100, delete 50, verify index.len() == 50 ✓
 
 ### Phase 2: Switch query path to use index
-- [ ] Use `index.search()` when index exists and has vectors
-- [ ] Fall back to brute-force when no index or empty
-- [ ] Test: `test_query_uses_index` — upsert 1000 docs, query, results match brute-force within recall tolerance
-- [ ] Test: `test_fallback_to_brute_force` — query empty ns returns empty
+- [x] Use `index.search()` when index exists and has vectors
+- [x] Fall back to brute-force when no index or empty
+- [x] Safely handle index returning IDs for deleted docs (filter_map instead of unwrap)
+- [x] Test: `test_query_uses_index` — upsert 200 docs, query doc 0's vector, verify doc 0 is top result ✓
+- [x] Test: `test_query_deleted_not_returned` — delete doc, verify it's absent from results ✓
+- [x] Test: `test_fallback_to_brute_force_empty` — query empty ns returns empty ✓
 
 ### Phase 3: Recall test through full NamespaceManager path
 - [ ] Test: `test_recall_through_namespace_manager` — upsert 5000 128-dim docs, 50 queries, recall@10 > 0.85
@@ -42,3 +44,9 @@ This covers Steps 1-3 from the parent design doc (in-memory only, no S3 persiste
 - WAL replay rebuilds index from documents in `load_namespace()`
 - Added `ObjectStore::in_memory()` for testing without MinIO
 - 2 new tests pass, all 49 tests green
+
+### Phase 2 — DONE
+- Query path now uses `index.search()` when SPFreshIndex exists
+- Falls back to brute-force when no index (empty namespace)
+- Used `filter_map` in result mapping to handle index returning stale IDs
+- 3 new tests pass (query, deleted-not-returned, empty fallback), all 52 tests green
