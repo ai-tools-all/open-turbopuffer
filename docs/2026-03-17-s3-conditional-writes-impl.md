@@ -5,7 +5,7 @@ depends_on:
   - docs/2026-02-12-18-58-08-s3-conditional-writes.md
   - docs/2026-03-17-spfresh-s3-persistence.md
 beads_issue: ot-004
-status: in-progress
+status: done
 ---
 
 # S3 Conditional Write Guards — Progress
@@ -29,11 +29,11 @@ Test against Cloudflare R2 (not local MinIO).
 - [x] All 67 existing tests still pass ✓
 
 ### Phase 3: Integration tests against Cloudflare R2
-- [ ] Create R2 ObjectStore from `.env.local.cf` credentials
-- [ ] Test: WAL exclusive write — write once succeeds, write same key again fails with WriteConflict
-- [ ] Test: Manifest CAS — read etag, write with if_match succeeds, stale etag fails
-- [ ] Test: Full persist_index roundtrip on R2
-- [ ] Cleanup: delete test prefix after tests
+- [x] Add `ObjectStore::new_r2()` constructor (builds R2 endpoint from account ID)
+- [x] Test: `test_r2_wal_exclusive_write` — write succeeds, duplicate fails with WriteConflict ✓
+- [x] Test: `test_r2_manifest_cas` — CAS update works, stale etag rejected ✓
+- [x] Test: `test_r2_full_persist_roundtrip` — full persist + CAS re-persist on R2 ✓
+- [x] Tests use nanos-based namespace prefix for isolation, cleanup after run
 
 ---
 
@@ -44,3 +44,10 @@ Test against Cloudflare R2 (not local MinIO).
 - Manifest writes use CAS via `if_match(etag)` / `if_not_exists(true)`
 - Falls back gracefully on backends that don't support conditionals (Memory)
 - ETag tracked in NamespaceState, loaded from S3 manifest on startup
+
+### Phase 3 — DONE
+- All 3 R2 integration tests pass against Cloudflare R2
+- WAL If-None-Match: * correctly rejects duplicate writes (412 → WriteConflict)
+- Manifest If-Match CAS correctly rejects stale etag (412 → WriteConflict)
+- Full persist_index + CAS re-persist roundtrip works on R2
+- Run with: `source .env.local.cf && cargo test -p tpuf-server -- --ignored test_r2 --nocapture`

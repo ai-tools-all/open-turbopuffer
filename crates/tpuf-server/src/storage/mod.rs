@@ -28,6 +28,19 @@ impl ObjectStore {
         Self { op: Arc::new(op) }
     }
 
+    pub fn new_r2(account_id: &str, bucket: &str, access_key: &str, secret_key: &str) -> Result<Self, StorageError> {
+        let endpoint = format!("https://{account_id}.r2.cloudflarestorage.com");
+        let builder = S3::default()
+            .endpoint(&endpoint)
+            .bucket(bucket)
+            .access_key_id(access_key)
+            .secret_access_key(secret_key)
+            .region("auto");
+
+        let op = Operator::new(builder)?.finish();
+        Ok(Self { op: Arc::new(op) })
+    }
+
     pub fn new(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) -> Result<Self, StorageError> {
         let builder = S3::default()
             .endpoint(endpoint)
@@ -354,5 +367,124 @@ mod tests {
         let loaded = store.read_index_manifest("ns1").await.unwrap().unwrap();
         assert_eq!(loaded.wal_sequence, 42);
         assert_eq!(loaded.num_vectors, 5000);
+    }
+
+    fn r2_store() -> Option<ObjectStore> {
+        let account_id = std::env::var("R2_ACCOUNT_ID").ok()?;
+        let access_key = std::env::var("R2_ACCESS_KEY_ID").ok()?;
+        let secret_key = std::env::var("R2_SECRET_ACCESS_KEY").ok()?;
+        let bucket = std::env::var("R2_DATA_BUCKET").unwrap_or_else(|_| "test".into());
+        Some(ObjectStore::new_r2(&account_id, &bucket, &access_key, &secret_key).unwrap())
+    }
+
+    fn r2_test_ns() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        format!("tpuf-test/{ts}")
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_r2_wal_exclusive_write() {
+        let store = r2_store().expect("R2 env vars not set");
+        let ns = r2_test_ns();
+
+        let entry = WalEntry {
+            sequence: 1,
+            timestamp_ms: 1000,
+            operations: vec![],
+        };
+
+        store.write_wal(&ns, &entry).await.unwrap();
+        println!("first WAL write succeeded");
+
+        let result = store.write_wal(&ns, &entry).await;
+        match result {
+            Err(StorageError::WriteConflict(msg)) => {
+                println!("second WAL write correctly rejected: {msg}");
+            }
+            Ok(()) => panic!("expected WriteConflict, got Ok — If-None-Match not enforced"),
+            Err(e) => panic!("expected WriteConflict, got: {e}"),
+        }
+
+        store.delete_namespace(&ns).await.unwrap();
+        println!("cleanup done");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_r2_manifest_cas() {
+        let store = r2_store().expect("R2 env vars not set");
+        let ns = r2_test_ns();
+
+        let manifest1 = IndexManifest {
+            version: 1,
+            wal_sequence: 1,
+            config: SPFreshConfig::default(),
+            active_centroids: 5,
+            num_vectors: 100,
+            created_at: 1000,
+        };
+
+        let etag1 = store.write_index_manifest_cas(&ns, &manifest1, None).await.unwrap();
+        println!("first manifest write succeeded, etag={etag1}");
+
+        let manifest2 = IndexManifest { wal_sequence: 2, num_vectors: 200, ..manifest1.clone() };
+        let etag2 = store.write_index_manifest_cas(&ns, &manifest2, Some(&etag1)).await.unwrap();
+        println!("CAS update succeeded, etag={etag2}");
+        assert_ne!(etag1, etag2, "etag should change after update");
+
+        let manifest3 = IndexManifest { wal_sequence: 3, num_vectors: 300, ..manifest1.clone() };
+        let result = store.write_index_manifest_cas(&ns, &manifest3, Some(&etag1)).await;
+        match result {
+            Err(StorageError::WriteConflict(msg)) => {
+                println!("stale etag correctly rejected: {msg}");
+            }
+            Ok(_) => panic!("expected WriteConflict for stale etag, got Ok"),
+            Err(e) => panic!("expected WriteConflict, got: {e}"),
+        }
+
+        let (loaded, loaded_etag) = store.read_index_manifest_with_etag(&ns).await.unwrap().unwrap();
+        assert_eq!(loaded.wal_sequence, 2, "manifest should still be at wal_sequence=2");
+        assert_eq!(loaded_etag, etag2, "loaded etag should match last successful write");
+
+        store.delete_namespace(&ns).await.unwrap();
+        println!("cleanup done");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_r2_full_persist_roundtrip() {
+        use crate::types::DistanceMetric;
+        use crate::engine::NamespaceManager;
+
+        let store = r2_store().expect("R2 env vars not set");
+        let ns = r2_test_ns();
+        let ns_name = ns.clone();
+
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.create_namespace(ns_name.clone(), DistanceMetric::EuclideanSquared).await.unwrap();
+
+        let docs: Vec<crate::types::Document> = (0..50u64).map(|i| {
+            crate::types::Document {
+                id: i,
+                vector: Some(vec![i as f32; 8]),
+                attributes: std::collections::HashMap::new(),
+            }
+        }).collect();
+        mgr.upsert(&ns_name, docs).await.unwrap();
+
+        mgr.persist_index(&ns_name).await.unwrap();
+        println!("persist succeeded on R2");
+
+        let (manifest, etag) = store.read_index_manifest_with_etag(&ns_name).await.unwrap().unwrap();
+        println!("manifest: vectors={}, centroids={}, etag={etag}", manifest.num_vectors, manifest.active_centroids);
+        assert_eq!(manifest.num_vectors, 50);
+
+        mgr.persist_index(&ns_name).await.unwrap();
+        println!("second persist (CAS update) succeeded");
+
+        store.delete_namespace(&ns_name).await.unwrap();
+        println!("cleanup done");
     }
 }
