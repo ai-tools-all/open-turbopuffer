@@ -1,7 +1,8 @@
 use opendal::{Operator, services::S3};
 use std::sync::Arc;
 use tracing::debug;
-use crate::types::{NamespaceMetadata, WalEntry};
+use crate::types::{NamespaceMetadata, WalEntry, IndexManifest};
+use crate::engine::index::spfresh::{CentroidsFile, VersionMapFile, PostingList};
 
 #[derive(Clone)]
 pub struct ObjectStore {
@@ -129,6 +130,78 @@ impl ObjectStore {
         Ok(namespaces)
     }
 
+    fn index_manifest_key(ns: &str) -> String {
+        format!("{ns}/index/manifest.bin")
+    }
+
+    fn centroids_key(ns: &str) -> String {
+        format!("{ns}/index/centroids.bin")
+    }
+
+    fn version_map_key(ns: &str) -> String {
+        format!("{ns}/index/version_map.bin")
+    }
+
+    fn posting_key(ns: &str, head_id: u32) -> String {
+        format!("{ns}/index/postings/{head_id:010}.bin")
+    }
+
+    pub async fn write_index_manifest(&self, ns: &str, manifest: &IndexManifest) -> Result<(), StorageError> {
+        let data = Self::encode(manifest)?;
+        self.op.write(&Self::index_manifest_key(ns), data).await?;
+        Ok(())
+    }
+
+    pub async fn read_index_manifest(&self, ns: &str) -> Result<Option<IndexManifest>, StorageError> {
+        match self.op.read(&Self::index_manifest_key(ns)).await {
+            Ok(data) => Ok(Some(Self::decode(&data.to_vec())?)),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn write_centroids(&self, ns: &str, file: &CentroidsFile) -> Result<(), StorageError> {
+        let data = Self::encode(file)?;
+        self.op.write(&Self::centroids_key(ns), data).await?;
+        Ok(())
+    }
+
+    pub async fn read_centroids(&self, ns: &str) -> Result<Option<CentroidsFile>, StorageError> {
+        match self.op.read(&Self::centroids_key(ns)).await {
+            Ok(data) => Ok(Some(Self::decode(&data.to_vec())?)),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn write_version_map(&self, ns: &str, file: &VersionMapFile) -> Result<(), StorageError> {
+        let data = Self::encode(file)?;
+        self.op.write(&Self::version_map_key(ns), data).await?;
+        Ok(())
+    }
+
+    pub async fn read_version_map(&self, ns: &str) -> Result<Option<VersionMapFile>, StorageError> {
+        match self.op.read(&Self::version_map_key(ns)).await {
+            Ok(data) => Ok(Some(Self::decode(&data.to_vec())?)),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn write_posting(&self, ns: &str, head_id: u32, posting: &PostingList) -> Result<(), StorageError> {
+        let data = Self::encode(posting)?;
+        self.op.write(&Self::posting_key(ns, head_id), data).await?;
+        Ok(())
+    }
+
+    pub async fn read_posting(&self, ns: &str, head_id: u32) -> Result<Option<PostingList>, StorageError> {
+        match self.op.read(&Self::posting_key(ns, head_id)).await {
+            Ok(data) => Ok(Some(Self::decode(&data.to_vec())?)),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn delete_namespace(&self, ns: &str) -> Result<(), StorageError> {
         let prefix = Self::ns_prefix(ns);
         let entries = self.op.list(&prefix).await?;
@@ -139,5 +212,81 @@ impl ObjectStore {
         self.op.delete(&Self::meta_key(ns)).await?;
         Ok(())
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::index::spfresh::{PostingEntry, SPFreshConfig};
+
+    #[tokio::test]
+    async fn test_s3_centroids_write_read() {
+        let store = ObjectStore::in_memory();
+        let file = CentroidsFile {
+            dims: 3,
+            next_id: 2,
+            centroids: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            active: vec![true, true],
+        };
+        store.write_centroids("ns1", &file).await.unwrap();
+        let loaded = store.read_centroids("ns1").await.unwrap().unwrap();
+        assert_eq!(file, loaded);
+    }
+
+    #[tokio::test]
+    async fn test_s3_centroids_missing() {
+        let store = ObjectStore::in_memory();
+        let loaded = store.read_centroids("missing").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_s3_version_map_write_read() {
+        let store = ObjectStore::in_memory();
+        let file = VersionMapFile {
+            capacity: 4,
+            data: vec![0, 1, 2, 0x83],
+        };
+        store.write_version_map("ns1", &file).await.unwrap();
+        let loaded = store.read_version_map("ns1").await.unwrap().unwrap();
+        assert_eq!(file, loaded);
+    }
+
+    #[tokio::test]
+    async fn test_s3_posting_write_read() {
+        let store = ObjectStore::in_memory();
+        let posting = PostingList {
+            entries: vec![
+                PostingEntry { vector_id: 1, version: 1, vector: vec![1.0, 2.0] },
+                PostingEntry { vector_id: 2, version: 3, vector: vec![3.0, 4.0] },
+            ],
+        };
+        store.write_posting("ns1", 5, &posting).await.unwrap();
+        let loaded = store.read_posting("ns1", 5).await.unwrap().unwrap();
+        assert_eq!(posting, loaded);
+    }
+
+    #[tokio::test]
+    async fn test_s3_posting_missing() {
+        let store = ObjectStore::in_memory();
+        let loaded = store.read_posting("ns1", 99).await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_s3_manifest_write_read() {
+        let store = ObjectStore::in_memory();
+        let manifest = IndexManifest {
+            version: 1,
+            wal_sequence: 42,
+            config: SPFreshConfig::default(),
+            active_centroids: 10,
+            num_vectors: 5000,
+            created_at: 123456,
+        };
+        store.write_index_manifest("ns1", &manifest).await.unwrap();
+        let loaded = store.read_index_manifest("ns1").await.unwrap().unwrap();
+        assert_eq!(loaded.wal_sequence, 42);
+        assert_eq!(loaded.num_vectors, 5000);
+    }
 }

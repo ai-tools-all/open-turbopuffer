@@ -25,11 +25,14 @@ Covers Steps 4-7 from the parent design doc.
 - [x] Test: `test_manifest_roundtrip` — IndexManifest bincode encode/decode ✓
 
 ### Phase 5: S3 storage methods for index files
-- [ ] Add key helpers (manifest, centroids, version_map, posting)
-- [ ] Add write/read methods for each index type
-- [ ] Test: `test_s3_centroids_write_read` — write CentroidsFile to in-memory store, read back
-- [ ] Test: `test_s3_posting_write_read` — write PostingList, read back
-- [ ] Test: `test_s3_version_map_write_read` — write VersionMapFile, read back
+- [x] Add key helpers (manifest, centroids, version_map, posting)
+- [x] Add write/read methods for each index type (8 methods total)
+- [x] Test: `test_s3_centroids_write_read` ✓
+- [x] Test: `test_s3_centroids_missing` — returns None for missing ✓
+- [x] Test: `test_s3_version_map_write_read` ✓
+- [x] Test: `test_s3_posting_write_read` ✓
+- [x] Test: `test_s3_posting_missing` — returns None ✓
+- [x] Test: `test_s3_manifest_write_read` ✓
 
 ### Phase 6: persist_index (manifest-last protocol)
 - [ ] Implement `persist_index()` on NamespaceManager
@@ -54,3 +57,8 @@ Covers Steps 4-7 from the parent design doc.
 - SPFreshConfig now has `Serialize`/`Deserialize`
 - SPFreshIndex gets `from_parts()` constructor + accessor methods
 - 3 new roundtrip tests pass, all 57 tests green
+
+### Phase 5 — DONE
+- 8 new S3 methods (write/read for manifest, centroids, version_map, postings)
+- Key format: `{ns}/index/{manifest|centroids|version_map}.bin`, `{ns}/index/postings/{hid:010}.bin`
+- 6 new storage tests pass, all 63 tests green
