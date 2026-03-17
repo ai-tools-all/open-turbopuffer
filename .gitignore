@@ -4,3 +4,4 @@ target/
 docs/SPFresh-ref/
 .specstory/
 .beads/
+.env.local.*

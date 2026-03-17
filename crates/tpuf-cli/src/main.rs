@@ -9,7 +9,7 @@ struct Cli {
     #[arg(long, default_value = "http://localhost:3000")]
     server: String,
 
-    #[command(subcommand)]
+    #[comman    d(subcommand)]
     command: Commands,
 }
 
