@@ -35,9 +35,9 @@ Covers Steps 4-7 from the parent design doc.
 - [x] Test: `test_s3_manifest_write_read` ✓
 
 ### Phase 6: persist_index (manifest-last protocol)
-- [ ] Implement `persist_index()` on NamespaceManager
-- [ ] Write postings → centroids → version_map → manifest (last)
-- [ ] Test: `test_persist_index` — upsert docs, persist, verify files exist in store
+- [x] Implement `persist_index()` on NamespaceManager
+- [x] Write postings → centroids → version_map → manifest (last)
+- [x] Test: `test_persist_index` — upsert 200, persist, verify manifest/centroids/version_map exist ✓
 
 ### Phase 7: load_index from S3 on startup (with WAL catch-up)
 - [ ] Modify `load_namespace()` to try loading index from S3 manifest
@@ -62,3 +62,8 @@ Covers Steps 4-7 from the parent design doc.
 - 8 new S3 methods (write/read for manifest, centroids, version_map, postings)
 - Key format: `{ns}/index/{manifest|centroids|version_map}.bin`, `{ns}/index/postings/{hid:010}.bin`
 - 6 new storage tests pass, all 63 tests green
+
+### Phase 6 — DONE
+- `persist_index()` writes postings → centroids → version_map → manifest (manifest-last)
+- If crash before manifest write, startup ignores partial data
+- 1 new test passes, all 64 tests green

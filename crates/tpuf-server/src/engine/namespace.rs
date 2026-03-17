@@ -9,7 +9,7 @@ use crate::types::*;
 use super::search::brute_force_knn;
 use super::batcher::WriteBatcher;
 use super::index::VectorIndex;
-use super::index::spfresh::{SPFreshIndex, SPFreshConfig};
+use super::index::spfresh::{SPFreshIndex, SPFreshConfig, PostingStore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -308,6 +308,57 @@ impl NamespaceManager {
         Ok(())
     }
 
+    pub async fn persist_index(&self, ns: &str) -> Result<(), EngineError> {
+        let ns_state = {
+            let namespaces = self.namespaces.read().await;
+            namespaces.get(ns)
+                .ok_or_else(|| EngineError::NotFound(ns.to_string()))?
+                .clone()
+        };
+        let state = ns_state.read().await;
+
+        let index = match &state.index {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+
+        let hi = index.head_index().read().unwrap();
+
+        for hid in 0..hi.next_id() {
+            if hi.is_active(hid) {
+                if let Some(posting) = index.posting_store().get(hid) {
+                    self.store.write_posting(ns, hid, &posting).await?;
+                }
+            }
+        }
+
+        self.store.write_centroids(ns, &hi.to_file()).await?;
+
+        let vm = index.version_map().read().unwrap();
+        self.store.write_version_map(ns, &vm.to_file()).await?;
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let manifest = IndexManifest {
+            version: 1,
+            wal_sequence: state.metadata.wal_sequence,
+            config: index.config().clone(),
+            active_centroids: hi.len() as u32,
+            num_vectors: index.len() as u64,
+            created_at: now,
+        };
+        self.store.write_index_manifest(ns, &manifest).await?;
+
+        info!(
+            namespace = %ns,
+            vectors = manifest.num_vectors,
+            centroids = manifest.active_centroids,
+            wal_seq = manifest.wal_sequence,
+            "index persisted to S3"
+        );
+
+        Ok(())
+    }
+
     pub async fn index_len(&self, ns: &str) -> Result<usize, EngineError> {
         let namespaces = self.namespaces.read().await;
         let ns_state = namespaces.get(ns)
@@ -589,5 +640,29 @@ mod tests {
         let avg_recall = total_recall / 20.0;
         println!("Mixed ops recall@{k}: {avg_recall:.4}");
         assert!(avg_recall > 0.80, "Mixed ops recall@{k} = {avg_recall:.4}, expected > 0.80");
+    }
+
+    #[tokio::test]
+    async fn test_persist_index() {
+        let store = crate::storage::ObjectStore::in_memory();
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+
+        let docs = make_docs(0, 200, 32);
+        mgr.upsert("test", docs).await.unwrap();
+
+        mgr.persist_index("test").await.unwrap();
+
+        let manifest = store.read_index_manifest("test").await.unwrap();
+        assert!(manifest.is_some(), "manifest should exist after persist");
+        let manifest = manifest.unwrap();
+        assert_eq!(manifest.num_vectors, 200);
+        assert!(manifest.active_centroids > 0);
+
+        let centroids = store.read_centroids("test").await.unwrap();
+        assert!(centroids.is_some(), "centroids file should exist");
+
+        let vmap = store.read_version_map("test").await.unwrap();
+        assert!(vmap.is_some(), "version_map file should exist");
     }
 }
