@@ -2208,6 +2208,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tpuf-indexer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rand 0.8.5",
+ "tokio",
+ "tpuf-server",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tpuf-server"
 version = "0.1.0"
 dependencies = [

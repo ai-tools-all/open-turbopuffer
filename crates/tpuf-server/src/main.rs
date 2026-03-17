@@ -1,10 +1,6 @@
-mod api;
-mod engine;
-mod storage;
-mod types;
-
 use std::sync::Arc;
 use tracing::info;
+use tpuf_server::{api, engine, storage};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,6 +24,17 @@ async fn main() -> anyhow::Result<()> {
     info!("replaying WAL from S3...");
     mgr.init().await?;
     info!("WAL replay complete");
+
+    let reload_mgr = Arc::clone(&mgr);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            reload_mgr.reload_indexes_if_changed().await;
+        }
+    });
+    info!("index hot-reload enabled (30s interval)");
 
     let app = api::router().with_state(mgr);
 

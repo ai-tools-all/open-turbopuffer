@@ -56,3 +56,16 @@ pub fn brute_force_knn(
     scored.truncate(top_k);
     scored
 }
+
+pub fn merge_top_k(
+    a: &[(u64, f32)],
+    b: &[(u64, f32)],
+    top_k: usize,
+) -> Vec<(u64, f32)> {
+    let mut merged = Vec::with_capacity(a.len() + b.len());
+    merged.extend_from_slice(a);
+    merged.extend_from_slice(b);
+    merged.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.truncate(top_k);
+    merged
+}

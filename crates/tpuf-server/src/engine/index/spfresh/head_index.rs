@@ -1,5 +1,14 @@
+use serde::{Serialize, Deserialize};
 use crate::engine::search::distance;
 use crate::types::DistanceMetric;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CentroidsFile {
+    pub dims: usize,
+    pub next_id: u32,
+    pub centroids: Vec<f32>,
+    pub active: Vec<bool>,
+}
 
 pub struct HeadIndex {
     centroids: Vec<f32>,
@@ -77,6 +86,35 @@ impl HeadIndex {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+
+    pub fn is_active(&self, head_id: u32) -> bool {
+        let idx = head_id as usize;
+        idx < self.active.len() && self.active[idx]
+    }
+
+    pub fn to_file(&self) -> CentroidsFile {
+        CentroidsFile {
+            dims: self.dims,
+            next_id: self.next_id,
+            centroids: self.centroids.clone(),
+            active: self.active.clone(),
+        }
+    }
+
+    pub fn from_file(file: CentroidsFile) -> Self {
+        let count = file.active.iter().filter(|&&a| a).count();
+        Self {
+            dims: file.dims,
+            next_id: file.next_id,
+            centroids: file.centroids,
+            active: file.active,
+            count,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +183,29 @@ mod tests {
 
         let results = idx.search(&[0.0, 0.0], 100, DistanceMetric::EuclideanSquared);
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_centroids_roundtrip() {
+        let mut idx = HeadIndex::new(3);
+        idx.add_centroid(&[1.0, 0.0, 0.0]);
+        idx.add_centroid(&[0.0, 1.0, 0.0]);
+        idx.add_centroid(&[0.0, 0.0, 1.0]);
+        idx.remove_centroid(1);
+
+        let file = idx.to_file();
+        let bytes = bincode::serialize(&file).unwrap();
+        let decoded: CentroidsFile = bincode::deserialize(&bytes).unwrap();
+        let restored = HeadIndex::from_file(decoded);
+
+        assert_eq!(restored.len(), 2);
+        assert!(restored.is_active(0));
+        assert!(!restored.is_active(1));
+        assert!(restored.is_active(2));
+        assert_eq!(restored.next_id(), 3);
+
+        let orig_results = idx.search(&[1.0, 0.0, 0.0], 3, DistanceMetric::EuclideanSquared);
+        let rest_results = restored.search(&[1.0, 0.0, 0.0], 3, DistanceMetric::EuclideanSquared);
+        assert_eq!(orig_results, rest_results);
     }
 }

@@ -81,3 +81,37 @@ pub enum WriteOp {
     Upsert(Vec<Document>),
     Delete(Vec<u64>),
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexManifest {
+    pub version: u32,
+    pub wal_sequence: u64,
+    pub config: crate::engine::index::spfresh::SPFreshConfig,
+    pub active_centroids: u32,
+    pub num_vectors: u64,
+    pub created_at: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_roundtrip() {
+        let manifest = IndexManifest {
+            version: 1,
+            wal_sequence: 42,
+            config: crate::engine::index::spfresh::SPFreshConfig::default(),
+            active_centroids: 10,
+            num_vectors: 5000,
+            created_at: 1234567890,
+        };
+        let bytes = bincode::serialize(&manifest).unwrap();
+        let decoded: IndexManifest = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.wal_sequence, 42);
+        assert_eq!(decoded.active_centroids, 10);
+        assert_eq!(decoded.num_vectors, 5000);
+        assert_eq!(decoded.created_at, 1234567890);
+    }
+}

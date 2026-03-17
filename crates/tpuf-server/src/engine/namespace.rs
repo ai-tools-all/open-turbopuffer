@@ -6,8 +6,10 @@ use tracing::info;
 
 use crate::storage::ObjectStore;
 use crate::types::*;
-use super::search::brute_force_knn;
+use super::search::{brute_force_knn, merge_top_k};
 use super::batcher::WriteBatcher;
+use super::index::VectorIndex;
+use super::index::spfresh::{SPFreshIndex, SPFreshConfig, PostingStore, HeadIndex, MemoryPostingStore, VersionMap};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -28,6 +30,10 @@ pub enum EngineError {
 struct NamespaceState {
     metadata: NamespaceMetadata,
     documents: HashMap<u64, Document>,
+    doc_sequences: HashMap<u64, u64>,
+    index: Option<SPFreshIndex>,
+    manifest_etag: Option<String>,
+    indexed_up_to_seq: u64,
 }
 
 pub struct NamespaceManager {
@@ -59,15 +65,31 @@ impl NamespaceManager {
             .ok_or_else(|| EngineError::NotFound(name.to_string()))?;
 
         let mut documents = HashMap::new();
+        let mut doc_sequences = HashMap::new();
         let sequences = self.store.list_wal_sequences(name).await?;
         for seq in &sequences {
             if let Some(entry) = self.store.read_wal(name, *seq).await? {
-                apply_wal_entry(&mut documents, &entry);
+                apply_wal_entry(&mut documents, &mut doc_sequences, &entry);
             }
         }
 
         let doc_count = documents.len() as u64;
         let wal_sequence = sequences.last().copied().unwrap_or(0);
+
+        let (index, manifest_etag, indexed_up_to_seq) = match self.try_load_index_from_s3(name).await {
+            Ok(Some((idx, etag, manifest_seq))) => {
+                info!(namespace = %name, manifest_seq, "loaded index from S3 manifest");
+                (Some(idx), Some(etag), manifest_seq)
+            }
+            Ok(None) => {
+                info!(namespace = %name, "no manifest found — running without index");
+                (None, None, 0)
+            }
+            Err(e) => {
+                info!(namespace = %name, error = %e, "failed to load index — running without index");
+                (None, None, 0)
+            }
+        };
 
         let state = NamespaceState {
             metadata: NamespaceMetadata {
@@ -76,12 +98,17 @@ impl NamespaceManager {
                 ..meta
             },
             documents,
+            doc_sequences,
+            index,
+            manifest_etag,
+            indexed_up_to_seq,
         };
 
         info!(
             namespace = %name,
             docs = doc_count,
             wal_entries = sequences.len(),
+            index_len = state.index.as_ref().map_or(0, |i| i.len()),
             "namespace loaded"
         );
 
@@ -92,6 +119,48 @@ impl NamespaceManager {
         self.batchers.write().await.insert(name.to_string(), batcher);
 
         Ok(())
+    }
+
+    async fn try_load_index_from_s3(
+        &self,
+        name: &str,
+    ) -> Result<Option<(SPFreshIndex, String, u64)>, EngineError> {
+        let (manifest, etag) = match self.store.read_index_manifest_with_etag(name).await? {
+            Some((m, e)) => (m, e),
+            None => return Ok(None),
+        };
+
+        let centroids_file = match self.store.read_centroids(name).await? {
+            Some(cf) => cf,
+            None => return Ok(None),
+        };
+        let vmap_file = match self.store.read_version_map(name).await? {
+            Some(vf) => vf,
+            None => return Ok(None),
+        };
+
+        let hi = HeadIndex::from_file(centroids_file);
+        let vm = VersionMap::from_file(vmap_file);
+        let posting_store = MemoryPostingStore::new();
+
+        for hid in 0..hi.next_id() {
+            if hi.is_active(hid) {
+                if let Some(pl) = self.store.read_posting(name, hid).await? {
+                    posting_store.put(hid, pl);
+                }
+            }
+        }
+
+        let manifest_seq = manifest.wal_sequence;
+        let index = SPFreshIndex::from_parts(
+            manifest.config,
+            hi,
+            posting_store,
+            vm,
+            manifest.num_vectors as usize,
+        );
+
+        Ok(Some((index, etag, manifest_seq)))
     }
 
     pub async fn create_namespace(
@@ -120,6 +189,10 @@ impl NamespaceManager {
         let state = NamespaceState {
             metadata: meta,
             documents: HashMap::new(),
+            doc_sequences: HashMap::new(),
+            index: None,
+            manifest_etag: None,
+            indexed_up_to_seq: 0,
         };
 
         let arc_state = Arc::new(RwLock::new(state));
@@ -245,13 +318,81 @@ impl NamespaceManager {
         };
 
         self.store.write_wal(ns, &entry).await?;
-        apply_wal_entry(&mut state.documents, &entry);
+        {
+            let s = &mut *state;
+            apply_wal_entry(&mut s.documents, &mut s.doc_sequences, &entry);
+        }
 
         state.metadata.wal_sequence = seq;
         state.metadata.doc_count = state.documents.len() as u64;
         self.store.write_metadata(&state.metadata).await?;
 
         Ok(())
+    }
+
+    pub async fn persist_index(&self, ns: &str) -> Result<(), EngineError> {
+        let ns_state = {
+            let namespaces = self.namespaces.read().await;
+            namespaces.get(ns)
+                .ok_or_else(|| EngineError::NotFound(ns.to_string()))?
+                .clone()
+        };
+        let mut state = ns_state.write().await;
+
+        let (manifest, prev_etag) = {
+            let index = match &state.index {
+                Some(i) => i,
+                None => return Ok(()),
+            };
+
+            let hi = index.head_index().read().unwrap();
+
+            for hid in 0..hi.next_id() {
+                if hi.is_active(hid) {
+                    if let Some(posting) = index.posting_store().get(hid) {
+                        self.store.write_posting(ns, hid, &posting).await?;
+                    }
+                }
+            }
+
+            self.store.write_centroids(ns, &hi.to_file()).await?;
+
+            let vm = index.version_map().read().unwrap();
+            self.store.write_version_map(ns, &vm.to_file()).await?;
+
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            let manifest = IndexManifest {
+                version: 1,
+                wal_sequence: state.metadata.wal_sequence,
+                config: index.config().clone(),
+                active_centroids: hi.len() as u32,
+                num_vectors: index.len() as u64,
+                created_at: now,
+            };
+            let prev_etag = state.manifest_etag.clone();
+            (manifest, prev_etag)
+        };
+
+        let new_etag = self.store.write_index_manifest_cas(ns, &manifest, prev_etag.as_deref()).await?;
+        state.manifest_etag = Some(new_etag);
+
+        info!(
+            namespace = %ns,
+            vectors = manifest.num_vectors,
+            centroids = manifest.active_centroids,
+            wal_seq = manifest.wal_sequence,
+            "index persisted to S3"
+        );
+
+        Ok(())
+    }
+
+    pub async fn index_len(&self, ns: &str) -> Result<usize, EngineError> {
+        let namespaces = self.namespaces.read().await;
+        let ns_state = namespaces.get(ns)
+            .ok_or_else(|| EngineError::NotFound(ns.to_string()))?;
+        let state = ns_state.read().await;
+        Ok(state.index.as_ref().map_or(0, |idx| idx.len()))
     }
 
     pub async fn get_document(&self, ns: &str, id: u64) -> Result<Option<Document>, EngineError> {
@@ -286,25 +427,151 @@ impl NamespaceManager {
 
         let metric = distance_metric.unwrap_or(state.metadata.distance_metric);
 
-        let vectors: Vec<(u64, &[f32])> = state.documents.iter()
-            .filter_map(|(id, doc)| {
-                doc.vector.as_ref().map(|v| (*id, v.as_slice()))
+        let scored = if let Some(index) = &state.index {
+            let ann_results = if index.len() > 0 {
+                index.search(&vector, top_k)
+                    .map_err(|e| EngineError::Validation(e.to_string()))?
+            } else {
+                Vec::new()
+            };
+
+            let tail_vectors: Vec<(u64, &[f32])> = state.documents.iter()
+                .filter(|(id, _)| {
+                    state.doc_sequences.get(id)
+                        .map_or(false, |&seq| seq > state.indexed_up_to_seq)
+                })
+                .filter_map(|(id, doc)| doc.vector.as_ref().map(|v| (*id, v.as_slice())))
+                .collect();
+
+            if tail_vectors.is_empty() {
+                info!(
+                    namespace = %ns,
+                    ann_hits = ann_results.len(),
+                    tail_size = 0,
+                    "query: index only (no tail)"
+                );
+                ann_results
+            } else {
+                let tail_ids: std::collections::HashSet<u64> =
+                    tail_vectors.iter().map(|(id, _)| *id).collect();
+                let ann_filtered: Vec<(u64, f32)> = ann_results.into_iter()
+                    .filter(|(id, _)| !tail_ids.contains(id))
+                    .collect();
+                let tail_results = brute_force_knn(&vector, &tail_vectors, metric, top_k);
+                let merged = merge_top_k(&ann_filtered, &tail_results, top_k);
+
+                let from_ann: Vec<u64> = merged.iter()
+                    .filter(|(id, _)| !tail_ids.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                let from_tail: Vec<u64> = merged.iter()
+                    .filter(|(id, _)| tail_ids.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                info!(
+                    namespace = %ns,
+                    tail_size = tail_vectors.len(),
+                    from_index = from_ann.len(),
+                    from_tail = from_tail.len(),
+                    index_ids = ?from_ann,
+                    tail_ids = ?from_tail,
+                    "query: hybrid (ANN + brute-force tail)"
+                );
+                merged
+            }
+        } else {
+            let vectors: Vec<(u64, &[f32])> = state.documents.iter()
+                .filter_map(|(id, doc)| {
+                    doc.vector.as_ref().map(|v| (*id, v.as_slice()))
+                })
+                .collect();
+            info!(
+                namespace = %ns,
+                brute_force_size = vectors.len(),
+                "query: full brute-force (no index)"
+            );
+            brute_force_knn(&vector, &vectors, metric, top_k)
+        };
+
+        let query_results: Vec<QueryResult> = scored.into_iter()
+            .filter_map(|(id, dist)| {
+                state.documents.get(&id).map(|doc| QueryResult {
+                    id,
+                    dist,
+                    vector: if include_vectors { doc.vector.clone() } else { None },
+                    attributes: doc.attributes.clone(),
+                })
             })
             .collect();
 
-        let results = brute_force_knn(&vector, &vectors, metric, top_k);
-
-        let query_results: Vec<QueryResult> = results.into_iter().map(|(id, dist)| {
-            let doc = state.documents.get(&id).unwrap();
-            QueryResult {
-                id,
-                dist,
-                vector: if include_vectors { doc.vector.clone() } else { None },
-                attributes: doc.attributes.clone(),
-            }
-        }).collect();
-
         Ok(query_results)
+    }
+
+    pub async fn reload_indexes_if_changed(&self) {
+        let ns_names: Vec<String> = {
+            let ns = self.namespaces.read().await;
+            ns.keys().cloned().collect()
+        };
+
+        for name in ns_names {
+            if let Err(e) = self.try_reload_index(&name).await {
+                info!(namespace = %name, error = %e, "index reload check failed");
+            }
+        }
+    }
+
+    async fn try_reload_index(&self, name: &str) -> Result<(), EngineError> {
+        let current_etag = {
+            let namespaces = self.namespaces.read().await;
+            let ns_state = match namespaces.get(name) {
+                Some(s) => s.clone(),
+                None => return Ok(()),
+            };
+            let state = ns_state.read().await;
+            state.manifest_etag.clone()
+        };
+
+        let s3_etag = match self.store.read_index_manifest_with_etag(name).await? {
+            Some((_, etag)) => Some(etag),
+            None => None,
+        };
+
+        let changed = match (&current_etag, &s3_etag) {
+            (Some(cur), Some(s3)) => cur != s3,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+
+        if !changed {
+            return Ok(());
+        }
+
+        let (index, etag, manifest_seq) = match self.try_load_index_from_s3(name).await? {
+            Some(result) => result,
+            None => return Ok(()),
+        };
+
+        let namespaces = self.namespaces.read().await;
+        let ns_state = match namespaces.get(name) {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        let mut state = ns_state.write().await;
+
+        let old_seq = state.indexed_up_to_seq;
+        state.index = Some(index);
+        state.manifest_etag = Some(etag);
+        state.indexed_up_to_seq = manifest_seq;
+
+        info!(
+            namespace = %name,
+            old_seq,
+            new_seq = manifest_seq,
+            index_len = state.index.as_ref().map_or(0, |i| i.len()),
+            "hot-reloaded index from S3"
+        );
+
+        Ok(())
     }
 }
 
@@ -317,19 +584,570 @@ pub struct QueryResult {
     pub attributes: HashMap<String, AttributeValue>,
 }
 
-fn apply_wal_entry(documents: &mut HashMap<u64, Document>, entry: &WalEntry) {
+pub fn replay_into_index(index: &mut SPFreshIndex, entry: &WalEntry) {
+    for op in &entry.operations {
+        match op {
+            WriteOp::Upsert(docs) => {
+                for doc in docs {
+                    if let Some(vec) = &doc.vector {
+                        let _ = index.insert(doc.id, vec);
+                    }
+                }
+            }
+            WriteOp::Delete(ids) => {
+                for &id in ids {
+                    let _ = index.delete(id);
+                }
+            }
+        }
+    }
+}
+
+pub fn apply_wal_entry(
+    documents: &mut HashMap<u64, Document>,
+    doc_sequences: &mut HashMap<u64, u64>,
+    entry: &WalEntry,
+) {
     for op in &entry.operations {
         match op {
             WriteOp::Upsert(docs) => {
                 for doc in docs {
                     documents.insert(doc.id, doc.clone());
+                    doc_sequences.insert(doc.id, entry.sequence);
                 }
             }
             WriteOp::Delete(ids) => {
                 for id in ids {
                     documents.remove(id);
+                    doc_sequences.remove(id);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_doc(id: u64, vector: Vec<f32>) -> Document {
+        Document {
+            id,
+            vector: Some(vector),
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn make_docs(start: u64, count: u64, dims: usize) -> Vec<Document> {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(start);
+        (start..start + count)
+            .map(|id| {
+                let v: Vec<f32> = (0..dims).map(|_| rng.gen::<f32>() - 0.5).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let v = if norm > 0.0 { v.iter().map(|x| x / norm).collect() } else { v };
+                make_doc(id, v)
+            })
+            .collect()
+    }
+
+    async fn test_manager() -> NamespaceManager {
+        let store = crate::storage::ObjectStore::in_memory();
+        let mgr = NamespaceManager::new(store);
+        mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+        mgr
+    }
+
+    async fn build_and_persist_test_index(store: &crate::storage::ObjectStore, ns: &str) {
+        use crate::engine::index::VectorIndex;
+        use crate::engine::index::spfresh::PostingStore;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let meta = store.read_metadata(ns).await.unwrap().unwrap();
+        let sequences = store.list_wal_sequences(ns).await.unwrap();
+
+        let dims = meta.dimensions.unwrap();
+        let config = SPFreshConfig {
+            dimensions: dims,
+            distance_metric: meta.distance_metric,
+            ..Default::default()
+        };
+        let mut idx = SPFreshIndex::new(config);
+
+        let mut wal_seq = 0u64;
+        for seq in &sequences {
+            if let Some(entry) = store.read_wal(ns, *seq).await.unwrap() {
+                replay_into_index(&mut idx, &entry);
+                wal_seq = entry.sequence;
+            }
+        }
+
+        let hi = idx.head_index().read().unwrap();
+        for hid in 0..hi.next_id() {
+            if hi.is_active(hid) {
+                if let Some(posting) = idx.posting_store().get(hid) {
+                    store.write_posting(ns, hid, &posting).await.unwrap();
+                }
+            }
+        }
+        store.write_centroids(ns, &hi.to_file()).await.unwrap();
+        let vm = idx.version_map().read().unwrap();
+        store.write_version_map(ns, &vm.to_file()).await.unwrap();
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let manifest = IndexManifest {
+            version: 1,
+            wal_sequence: wal_seq,
+            config: idx.config().clone(),
+            active_centroids: hi.len() as u32,
+            num_vectors: idx.len() as u64,
+            created_at: now,
+        };
+        drop(hi);
+        drop(vm);
+
+        store.write_index_manifest(ns, &manifest).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_upsert_queries_via_brute_force() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 100, 32);
+        let query_vec = docs[0].vector.clone().unwrap();
+        mgr.upsert("test", docs).await.unwrap();
+
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 0, "no inline indexing — index should be empty");
+
+        let results = mgr.query("test", query_vec, 10, None, false).await.unwrap();
+        assert!(!results.is_empty(), "brute-force should return results");
+        assert_eq!(results[0].id, 0, "nearest neighbor of doc 0 should be itself");
+    }
+
+    #[tokio::test]
+    async fn test_delete_excluded_from_queries() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 100, 32);
+        mgr.upsert("test", docs.clone()).await.unwrap();
+
+        let ids_to_delete: Vec<u64> = (0..50).collect();
+        mgr.delete_docs("test", ids_to_delete.clone()).await.unwrap();
+
+        for &id in &[0u64, 25, 49] {
+            let qv = docs[id as usize].vector.clone().unwrap();
+            let results = mgr.query("test", qv, 10, None, false).await.unwrap();
+            let result_ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+            assert!(!result_ids.contains(&id), "deleted doc {id} should not appear in results");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_query_uses_index() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 200, 32);
+        let query_vec = docs[0].vector.clone().unwrap();
+        mgr.upsert("test", docs).await.unwrap();
+
+        let results = mgr.query("test", query_vec, 10, None, false).await.unwrap();
+        assert!(!results.is_empty(), "query should return results");
+        assert_eq!(results[0].id, 0, "nearest neighbor of doc 0 should be doc 0 itself");
+    }
+
+    #[tokio::test]
+    async fn test_query_deleted_not_returned() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 100, 32);
+        let query_vec = docs[0].vector.clone().unwrap();
+        mgr.upsert("test", docs).await.unwrap();
+
+        mgr.delete_docs("test", vec![0]).await.unwrap();
+
+        let results = mgr.query("test", query_vec, 10, None, false).await.unwrap();
+        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&0), "deleted doc 0 should not appear in results");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_to_brute_force_empty() {
+        let store = crate::storage::ObjectStore::in_memory();
+        let mgr = NamespaceManager::new(store);
+        mgr.create_namespace("empty".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+
+        let q = vec![0.0f32; 32];
+        let results = mgr.query("empty", q, 10, None, false).await.unwrap();
+        assert!(results.is_empty(), "empty namespace should return no results");
+    }
+
+    #[tokio::test]
+    async fn test_recall_through_namespace_manager() {
+        use crate::engine::search::brute_force_knn;
+
+        let dims = 128;
+        let n = 5000u64;
+        let k = 10;
+        let n_queries = 50;
+
+        let mgr = test_manager().await;
+        let docs = make_docs(0, n, dims);
+
+        let vectors: Vec<Vec<f32>> = docs.iter()
+            .map(|d| d.vector.clone().unwrap())
+            .collect();
+
+        for chunk in docs.chunks(500) {
+            mgr.upsert("test", chunk.to_vec()).await.unwrap();
+        }
+
+        let queries = make_docs(n, n_queries, dims);
+        let indexed: Vec<(u64, &[f32])> = vectors.iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v.as_slice()))
+            .collect();
+
+        let mut total_recall = 0.0;
+        for q_doc in &queries {
+            let qv = q_doc.vector.as_ref().unwrap();
+            let gt = brute_force_knn(qv, &indexed, DistanceMetric::EuclideanSquared, k);
+            let gt_ids: std::collections::HashSet<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+            let results = mgr.query("test", qv.clone(), k, None, false).await.unwrap();
+            let result_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
+
+            let overlap = gt_ids.intersection(&result_ids).count();
+            total_recall += overlap as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / n_queries as f64;
+        println!("E2E recall@{k}: {avg_recall:.4} (n={n}, queries={n_queries}, dims={dims})");
+        assert!(avg_recall > 0.85, "E2E recall@{k} = {avg_recall:.4}, expected > 0.85");
+    }
+
+    #[tokio::test]
+    async fn test_mixed_ops_recall() {
+        use crate::engine::search::brute_force_knn;
+
+        let dims = 32;
+        let k = 10;
+
+        let mgr = test_manager().await;
+
+        let initial_docs = make_docs(0, 500, dims);
+        mgr.upsert("test", initial_docs.clone()).await.unwrap();
+
+        let delete_ids: Vec<u64> = (0..100).collect();
+        mgr.delete_docs("test", delete_ids).await.unwrap();
+
+        let new_docs = make_docs(500, 200, dims);
+        mgr.upsert("test", new_docs.clone()).await.unwrap();
+
+        let remaining: Vec<(u64, Vec<f32>)> = initial_docs.iter()
+            .filter(|d| d.id >= 100)
+            .chain(new_docs.iter())
+            .map(|d| (d.id, d.vector.clone().unwrap()))
+            .collect();
+        let indexed: Vec<(u64, &[f32])> = remaining.iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+
+        let queries = make_docs(1000, 20, dims);
+        let mut total_recall = 0.0;
+        for q_doc in &queries {
+            let qv = q_doc.vector.as_ref().unwrap();
+            let gt = brute_force_knn(qv, &indexed, DistanceMetric::EuclideanSquared, k);
+            let gt_ids: std::collections::HashSet<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+            let results = mgr.query("test", qv.clone(), k, None, false).await.unwrap();
+            let result_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
+
+            let overlap = gt_ids.intersection(&result_ids).count();
+            total_recall += overlap as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / 20.0;
+        println!("Mixed ops recall@{k}: {avg_recall:.4}");
+        assert!(avg_recall > 0.80, "Mixed ops recall@{k} = {avg_recall:.4}, expected > 0.80");
+    }
+
+    #[tokio::test]
+    async fn test_persist_index() {
+        let store = crate::storage::ObjectStore::in_memory();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 200, 32);
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        build_and_persist_test_index(&store, "test").await;
+
+        let manifest = store.read_index_manifest("test").await.unwrap();
+        assert!(manifest.is_some(), "manifest should exist after persist");
+        let manifest = manifest.unwrap();
+        assert_eq!(manifest.num_vectors, 200);
+        assert!(manifest.active_centroids > 0);
+
+        let centroids = store.read_centroids("test").await.unwrap();
+        assert!(centroids.is_some(), "centroids file should exist");
+
+        let vmap = store.read_version_map("test").await.unwrap();
+        assert!(vmap.is_some(), "version_map file should exist");
+    }
+
+    #[tokio::test]
+    async fn test_persist_and_load_roundtrip() {
+        use crate::engine::search::brute_force_knn;
+
+        let dims = 32;
+        let k = 10;
+        let store = crate::storage::ObjectStore::in_memory();
+
+        let docs = make_docs(0, 1000, dims);
+        let vectors: Vec<Vec<f32>> = docs.iter()
+            .map(|d| d.vector.clone().unwrap())
+            .collect();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        build_and_persist_test_index(&store, "test").await;
+
+        {
+            let mgr2 = NamespaceManager::new(store.clone());
+            mgr2.init().await.unwrap();
+
+            let idx_len = mgr2.index_len("test").await.unwrap();
+            assert_eq!(idx_len, 1000, "loaded index should have 1000 vectors, got {idx_len}");
+
+            let queries = make_docs(2000, 20, dims);
+            let indexed: Vec<(u64, &[f32])> = vectors.iter()
+                .enumerate()
+                .map(|(i, v)| (i as u64, v.as_slice()))
+                .collect();
+
+            let mut total_recall = 0.0;
+            for q_doc in &queries {
+                let qv = q_doc.vector.as_ref().unwrap();
+                let gt = brute_force_knn(qv, &indexed, DistanceMetric::EuclideanSquared, k);
+                let gt_ids: std::collections::HashSet<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+                let results = mgr2.query("test", qv.clone(), k, None, false).await.unwrap();
+                let result_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
+
+                let overlap = gt_ids.intersection(&result_ids).count();
+                total_recall += overlap as f64 / k as f64;
+            }
+
+            let avg_recall = total_recall / 20.0;
+            println!("Persist-load recall@{k}: {avg_recall:.4}");
+            assert!(avg_recall > 0.85, "Persist-load recall@{k} = {avg_recall:.4}, expected > 0.85");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_indexer_then_more_writes_hybrid() {
+        let store = crate::storage::ObjectStore::in_memory();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 500, 32);
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        build_and_persist_test_index(&store, "test").await;
+
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.init().await.unwrap();
+
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 500, "index should have 500 vectors from manifest");
+
+        let more_docs = make_docs(500, 200, 32);
+        let tail_query = more_docs[0].vector.clone().unwrap();
+        mgr.upsert("test", more_docs).await.unwrap();
+
+        let results = mgr.query("test", tail_query, 10, None, false).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, 500, "tail doc 500 found via hybrid query");
+    }
+
+    #[tokio::test]
+    async fn test_no_manifest_runs_without_index() {
+        let store = crate::storage::ObjectStore::in_memory();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 300, 32);
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        {
+            let mgr2 = NamespaceManager::new(store.clone());
+            mgr2.init().await.unwrap();
+
+            let idx_len = mgr2.index_len("test").await.unwrap();
+            assert_eq!(idx_len, 0, "no manifest means no index");
+
+            let query = make_docs(0, 1, 32)[0].vector.clone().unwrap();
+            let results = mgr2.query("test", query, 10, None, false).await.unwrap();
+            assert!(!results.is_empty(), "brute-force should still return results");
+            assert_eq!(results[0].id, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_query_finds_unindexed() {
+        let store = crate::storage::ObjectStore::in_memory();
+        let dims = 32;
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 100, dims);
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        build_and_persist_test_index(&store, "test").await;
+
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.init().await.unwrap();
+
+        let tail_docs = make_docs(100, 50, dims);
+        let tail_query = tail_docs[0].vector.clone().unwrap();
+        mgr.upsert("test", tail_docs).await.unwrap();
+
+        let results = mgr.query("test", tail_query, 10, None, false).await.unwrap();
+        assert!(!results.is_empty(), "should return results");
+        assert_eq!(results[0].id, 100, "nearest neighbor of tail doc 100 should be itself");
+
+        let indexed_query = make_docs(0, 1, dims)[0].vector.clone().unwrap();
+        let results = mgr.query("test", indexed_query, 10, None, false).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, 0, "should find indexed doc 0");
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_query_recall() {
+        use crate::engine::search::brute_force_knn;
+
+        let store = crate::storage::ObjectStore::in_memory();
+        let dims = 32;
+        let k = 10;
+
+        let all_docs = make_docs(0, 1200, dims);
+        let indexed_docs: Vec<Document> = all_docs[..1000].to_vec();
+        let tail_docs: Vec<Document> = all_docs[1000..].to_vec();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            mgr.upsert("test", indexed_docs).await.unwrap();
+        }
+
+        build_and_persist_test_index(&store, "test").await;
+
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.init().await.unwrap();
+        mgr.upsert("test", tail_docs).await.unwrap();
+
+        let all_vectors: Vec<(u64, Vec<f32>)> = all_docs.iter()
+            .map(|d| (d.id, d.vector.clone().unwrap()))
+            .collect();
+        let indexed: Vec<(u64, &[f32])> = all_vectors.iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+
+        let queries = make_docs(5000, 50, dims);
+        let mut total_recall = 0.0;
+        for q_doc in &queries {
+            let qv = q_doc.vector.as_ref().unwrap();
+            let gt = brute_force_knn(qv, &indexed, DistanceMetric::EuclideanSquared, k);
+            let gt_ids: std::collections::HashSet<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+            let results = mgr.query("test", qv.clone(), k, None, false).await.unwrap();
+            let result_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
+
+            let overlap = gt_ids.intersection(&result_ids).count();
+            total_recall += overlap as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / 50.0;
+        println!("Hybrid recall@{k}: {avg_recall:.4} (1000 indexed + 200 tail)");
+        assert!(avg_recall > 0.85, "Hybrid recall@{k} = {avg_recall:.4}, expected > 0.85");
+    }
+
+    #[tokio::test]
+    async fn test_fully_indexed_no_tail_scan() {
+        let store = crate::storage::ObjectStore::in_memory();
+        let dims = 32;
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 200, dims);
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        build_and_persist_test_index(&store, "test").await;
+
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.init().await.unwrap();
+
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 200, "all docs should be in index from manifest");
+
+        let query = make_docs(0, 1, dims)[0].vector.clone().unwrap();
+        let results = mgr.query("test", query, 10, None, false).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_in_tail() {
+        let store = crate::storage::ObjectStore::in_memory();
+        let dims = 32;
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 100, dims);
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        build_and_persist_test_index(&store, "test").await;
+
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.init().await.unwrap();
+
+        let tail_docs = make_docs(100, 50, dims);
+        let tail_query = tail_docs[0].vector.clone().unwrap();
+        mgr.upsert("test", tail_docs).await.unwrap();
+
+        mgr.delete_docs("test", vec![100]).await.unwrap();
+
+        let results = mgr.query("test", tail_query, 10, None, false).await.unwrap();
+        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&100), "deleted tail doc 100 should not appear in results");
+    }
+
+    #[tokio::test]
+    async fn test_no_index_full_brute_force() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 100, 32);
+        let query_vec = docs[42].vector.clone().unwrap();
+        mgr.upsert("test", docs).await.unwrap();
+
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 0, "fresh namespace should have no index");
+
+        let results = mgr.query("test", query_vec, 10, None, false).await.unwrap();
+        assert!(!results.is_empty(), "brute-force should return results");
+        assert_eq!(results[0].id, 42, "nearest neighbor should be exact match");
     }
 }
