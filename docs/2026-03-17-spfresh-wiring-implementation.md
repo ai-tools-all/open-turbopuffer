@@ -3,7 +3,7 @@ title: "SPFresh Wiring Implementation"
 date: 2026-03-17
 depends_on:
   - docs/2026-02-26-14-32-07-spfresh-wiring-and-s3-centroids.md
-status: in-progress
+status: done
 ---
 
 # SPFresh Wiring Implementation — Progress
@@ -31,8 +31,8 @@ This covers Steps 1-3 from the parent design doc (in-memory only, no S3 persiste
 - [x] Test: `test_fallback_to_brute_force_empty` — query empty ns returns empty ✓
 
 ### Phase 3: Recall test through full NamespaceManager path
-- [ ] Test: `test_recall_through_namespace_manager` — upsert 5000 128-dim docs, 50 queries, recall@10 > 0.85
-- [ ] Test: `test_mixed_ops_recall` — insert 500, delete 100, insert 200, verify recall on remaining
+- [x] Test: `test_recall_through_namespace_manager` — 5000 docs, 128-dim, 50 queries, recall@10 = 1.0 ✓
+- [x] Test: `test_mixed_ops_recall` — insert 500, delete 100, insert 200, recall@10 = 1.0 ✓
 
 ---
 
@@ -50,3 +50,8 @@ This covers Steps 1-3 from the parent design doc (in-memory only, no S3 persiste
 - Falls back to brute-force when no index (empty namespace)
 - Used `filter_map` in result mapping to handle index returning stale IDs
 - 3 new tests pass (query, deleted-not-returned, empty fallback), all 52 tests green
+
+### Phase 3 — DONE
+- E2E recall@10 = 1.0 through NamespaceManager with 5000 vectors (128-dim)
+- Mixed ops (insert/delete/insert) recall@10 = 1.0
+- All 54 tests green

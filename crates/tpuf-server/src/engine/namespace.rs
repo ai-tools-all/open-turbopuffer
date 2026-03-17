@@ -497,4 +497,97 @@ mod tests {
         let results = mgr.query("empty", q, 10, None, false).await.unwrap();
         assert!(results.is_empty(), "empty namespace should return no results");
     }
+
+    #[tokio::test]
+    async fn test_recall_through_namespace_manager() {
+        use crate::engine::search::brute_force_knn;
+
+        let dims = 128;
+        let n = 5000u64;
+        let k = 10;
+        let n_queries = 50;
+
+        let mgr = test_manager().await;
+        let docs = make_docs(0, n, dims);
+
+        let vectors: Vec<Vec<f32>> = docs.iter()
+            .map(|d| d.vector.clone().unwrap())
+            .collect();
+
+        for chunk in docs.chunks(500) {
+            mgr.upsert("test", chunk.to_vec()).await.unwrap();
+        }
+
+        let queries = make_docs(n, n_queries, dims);
+        let indexed: Vec<(u64, &[f32])> = vectors.iter()
+            .enumerate()
+            .map(|(i, v)| (i as u64, v.as_slice()))
+            .collect();
+
+        let mut total_recall = 0.0;
+        for q_doc in &queries {
+            let qv = q_doc.vector.as_ref().unwrap();
+            let gt = brute_force_knn(qv, &indexed, DistanceMetric::EuclideanSquared, k);
+            let gt_ids: std::collections::HashSet<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+            let results = mgr.query("test", qv.clone(), k, None, false).await.unwrap();
+            let result_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
+
+            let overlap = gt_ids.intersection(&result_ids).count();
+            total_recall += overlap as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / n_queries as f64;
+        println!("E2E recall@{k}: {avg_recall:.4} (n={n}, queries={n_queries}, dims={dims})");
+        assert!(avg_recall > 0.85, "E2E recall@{k} = {avg_recall:.4}, expected > 0.85");
+    }
+
+    #[tokio::test]
+    async fn test_mixed_ops_recall() {
+        use crate::engine::search::brute_force_knn;
+
+        let dims = 32;
+        let k = 10;
+
+        let mgr = test_manager().await;
+
+        let initial_docs = make_docs(0, 500, dims);
+        mgr.upsert("test", initial_docs.clone()).await.unwrap();
+
+        let delete_ids: Vec<u64> = (0..100).collect();
+        mgr.delete_docs("test", delete_ids).await.unwrap();
+
+        let new_docs = make_docs(500, 200, dims);
+        mgr.upsert("test", new_docs.clone()).await.unwrap();
+
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 600, "expected 600 vectors (500 - 100 + 200), got {idx_len}");
+
+        let remaining: Vec<(u64, Vec<f32>)> = initial_docs.iter()
+            .filter(|d| d.id >= 100)
+            .chain(new_docs.iter())
+            .map(|d| (d.id, d.vector.clone().unwrap()))
+            .collect();
+        let indexed: Vec<(u64, &[f32])> = remaining.iter()
+            .map(|(id, v)| (*id, v.as_slice()))
+            .collect();
+
+        let queries = make_docs(1000, 20, dims);
+        let mut total_recall = 0.0;
+        for q_doc in &queries {
+            let qv = q_doc.vector.as_ref().unwrap();
+            let gt = brute_force_knn(qv, &indexed, DistanceMetric::EuclideanSquared, k);
+            let gt_ids: std::collections::HashSet<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+            let results = mgr.query("test", qv.clone(), k, None, false).await.unwrap();
+            let result_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
+
+            let overlap = gt_ids.intersection(&result_ids).count();
+            total_recall += overlap as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / 20.0;
+        println!("Mixed ops recall@{k}: {avg_recall:.4}");
+        assert!(avg_recall > 0.80, "Mixed ops recall@{k} = {avg_recall:.4}, expected > 0.80");
+    }
 }
