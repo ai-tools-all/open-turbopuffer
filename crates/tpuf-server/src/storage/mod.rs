@@ -19,6 +19,12 @@ pub enum StorageError {
 }
 
 impl ObjectStore {
+    #[cfg(test)]
+    pub fn in_memory() -> Self {
+        let op = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+        Self { op: Arc::new(op) }
+    }
+
     pub fn new(endpoint: &str, bucket: &str, access_key: &str, secret_key: &str, region: &str) -> Result<Self, StorageError> {
         let builder = S3::default()
             .endpoint(endpoint)

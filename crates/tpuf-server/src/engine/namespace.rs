@@ -8,6 +8,8 @@ use crate::storage::ObjectStore;
 use crate::types::*;
 use super::search::brute_force_knn;
 use super::batcher::WriteBatcher;
+use super::index::VectorIndex;
+use super::index::spfresh::{SPFreshIndex, SPFreshConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -28,6 +30,7 @@ pub enum EngineError {
 struct NamespaceState {
     metadata: NamespaceMetadata,
     documents: HashMap<u64, Document>,
+    index: Option<SPFreshIndex>,
 }
 
 pub struct NamespaceManager {
@@ -69,6 +72,24 @@ impl NamespaceManager {
         let doc_count = documents.len() as u64;
         let wal_sequence = sequences.last().copied().unwrap_or(0);
 
+        let index = if let Some(dims) = meta.dimensions {
+            let config = SPFreshConfig {
+                dimensions: dims,
+                distance_metric: meta.distance_metric,
+                ..Default::default()
+            };
+            let idx = SPFreshIndex::new(config);
+            for doc in documents.values() {
+                if let Some(vec) = &doc.vector {
+                    idx.insert(doc.id, vec)
+                        .map_err(|e| EngineError::Validation(e.to_string()))?;
+                }
+            }
+            Some(idx)
+        } else {
+            None
+        };
+
         let state = NamespaceState {
             metadata: NamespaceMetadata {
                 doc_count,
@@ -76,6 +97,7 @@ impl NamespaceManager {
                 ..meta
             },
             documents,
+            index,
         };
 
         info!(
@@ -120,6 +142,7 @@ impl NamespaceManager {
         let state = NamespaceState {
             metadata: meta,
             documents: HashMap::new(),
+            index: None,
         };
 
         let arc_state = Arc::new(RwLock::new(state));
@@ -247,11 +270,50 @@ impl NamespaceManager {
         self.store.write_wal(ns, &entry).await?;
         apply_wal_entry(&mut state.documents, &entry);
 
+        for op in &entry.operations {
+            match op {
+                WriteOp::Upsert(docs) => {
+                    for doc in docs {
+                        if let Some(vec) = &doc.vector {
+                            if state.index.is_none() {
+                                let dims = state.metadata.dimensions.unwrap();
+                                let metric = state.metadata.distance_metric;
+                                let config = SPFreshConfig {
+                                    dimensions: dims,
+                                    distance_metric: metric,
+                                    ..Default::default()
+                                };
+                                state.index = Some(SPFreshIndex::new(config));
+                            }
+                            state.index.as_ref().unwrap().insert(doc.id, vec)
+                                .map_err(|e| EngineError::Validation(e.to_string()))?;
+                        }
+                    }
+                }
+                WriteOp::Delete(ids) => {
+                    if let Some(index) = &state.index {
+                        for &id in ids {
+                            index.delete(id)
+                                .map_err(|e| EngineError::Validation(e.to_string()))?;
+                        }
+                    }
+                }
+            }
+        }
+
         state.metadata.wal_sequence = seq;
         state.metadata.doc_count = state.documents.len() as u64;
         self.store.write_metadata(&state.metadata).await?;
 
         Ok(())
+    }
+
+    pub async fn index_len(&self, ns: &str) -> Result<usize, EngineError> {
+        let namespaces = self.namespaces.read().await;
+        let ns_state = namespaces.get(ns)
+            .ok_or_else(|| EngineError::NotFound(ns.to_string()))?;
+        let state = ns_state.read().await;
+        Ok(state.index.as_ref().map_or(0, |idx| idx.len()))
     }
 
     pub async fn get_document(&self, ns: &str, id: u64) -> Result<Option<Document>, EngineError> {
@@ -317,7 +379,7 @@ pub struct QueryResult {
     pub attributes: HashMap<String, AttributeValue>,
 }
 
-fn apply_wal_entry(documents: &mut HashMap<u64, Document>, entry: &WalEntry) {
+pub(crate) fn apply_wal_entry(documents: &mut HashMap<u64, Document>, entry: &WalEntry) {
     for op in &entry.operations {
         match op {
             WriteOp::Upsert(docs) => {
@@ -331,5 +393,62 @@ fn apply_wal_entry(documents: &mut HashMap<u64, Document>, entry: &WalEntry) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_doc(id: u64, vector: Vec<f32>) -> Document {
+        Document {
+            id,
+            vector: Some(vector),
+            attributes: HashMap::new(),
+        }
+    }
+
+    fn make_docs(start: u64, count: u64, dims: usize) -> Vec<Document> {
+        use rand::Rng;
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(start);
+        (start..start + count)
+            .map(|id| {
+                let v: Vec<f32> = (0..dims).map(|_| rng.gen::<f32>() - 0.5).collect();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let v = if norm > 0.0 { v.iter().map(|x| x / norm).collect() } else { v };
+                make_doc(id, v)
+            })
+            .collect()
+    }
+
+    async fn test_manager() -> NamespaceManager {
+        let store = crate::storage::ObjectStore::in_memory();
+        let mgr = NamespaceManager::new(store);
+        mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+        mgr
+    }
+
+    #[tokio::test]
+    async fn test_index_built_on_upsert() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 100, 32);
+        mgr.upsert("test", docs).await.unwrap();
+
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 100, "index should have 100 vectors, got {idx_len}");
+    }
+
+    #[tokio::test]
+    async fn test_delete_removes_from_index() {
+        let mgr = test_manager().await;
+        let docs = make_docs(0, 100, 32);
+        mgr.upsert("test", docs).await.unwrap();
+
+        let ids_to_delete: Vec<u64> = (0..50).collect();
+        mgr.delete_docs("test", ids_to_delete).await.unwrap();
+
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 50, "index should have 50 vectors after deleting 50, got {idx_len}");
     }
 }
