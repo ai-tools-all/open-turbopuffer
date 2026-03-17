@@ -51,3 +51,59 @@ Test against Cloudflare R2 (not local MinIO).
 - Manifest If-Match CAS correctly rejects stale etag (412 → WriteConflict)
 - Full persist_index + CAS re-persist roundtrip works on R2
 - Run with: `source .env.local.cf && cargo test -p tpuf-server -- --ignored test_r2 --nocapture`
+
+---
+
+## What Was Built
+
+### Storage Layer (`storage/mod.rs`)
+
+**New error variant:**
+- `StorageError::WriteConflict(String)` — returned when a conditional write is rejected (HTTP 412)
+
+**Modified methods:**
+- `write_wal()` — now uses `op.write_with().if_not_exists(true)`, preventing duplicate WAL sequence numbers. Falls back to unconditional write on backends that don't support it (Memory).
+
+**New methods:**
+- `new_r2(account_id, bucket, access_key, secret_key)` — creates ObjectStore for Cloudflare R2
+- `write_index_manifest_cas(ns, manifest, prev_etag)` — CAS write: `if_not_exists` when `prev_etag=None`, `if_match(etag)` otherwise. Returns new ETag on success.
+- `read_index_manifest_with_etag(ns)` — returns `Option<(IndexManifest, String)>` with ETag from `stat()`
+
+### Engine Layer (`engine/namespace.rs`)
+
+- `NamespaceState` gains `manifest_etag: Option<String>` field
+- `persist_index()` uses `write_index_manifest_cas()` and updates stored ETag
+- `try_load_index_from_s3()` captures ETag via `read_index_manifest_with_etag()`
+
+### Guards Summary
+
+| Operation | Guard | Behavior on Conflict |
+|-----------|-------|---------------------|
+| WAL write (`wal/{seq}.wal`) | `If-None-Match: *` | `WriteConflict` — catches sequence counter bugs |
+| Index manifest write | `If-Match: <etag>` | `WriteConflict` — catches double-indexer |
+| First manifest write | `If-None-Match: *` | `WriteConflict` — catches race on first persist |
+
+### Commits
+- `668ab0f` — conditional writes + CAS wiring
+- `236d8e4` — R2 integration tests
+
+### How to Run R2 Tests
+
+```bash
+# Load Cloudflare R2 credentials
+source .env.local.cf
+
+# Run all 3 R2 integration tests
+cargo test -p tpuf-server -- --ignored test_r2 --nocapture
+
+# Run individually
+cargo test -p tpuf-server -- --ignored test_r2_wal_exclusive_write --nocapture
+cargo test -p tpuf-server -- --ignored test_r2_manifest_cas --nocapture
+cargo test -p tpuf-server -- --ignored test_r2_full_persist_roundtrip --nocapture
+```
+
+Tests create isolated namespaces under `tpuf-test/` prefix with nanosecond timestamps and clean up after themselves.
+
+### Related Issues
+- **ot-004** — closed, implemented here
+- **ot-005** — closed as duplicate of ot-004
