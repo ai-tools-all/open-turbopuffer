@@ -76,14 +76,18 @@ impl NamespaceManager {
         let doc_count = documents.len() as u64;
         let wal_sequence = sequences.last().copied().unwrap_or(0);
 
-        let (index, manifest_etag) = match self.try_load_index_from_s3(name, &sequences).await {
-            Ok(Some((idx, etag))) => {
-                info!(namespace = %name, "loaded index from S3 manifest");
-                (Some(idx), Some(etag))
+        let (index, manifest_etag, indexed_up_to_seq) = match self.try_load_index_from_s3(name).await {
+            Ok(Some((idx, etag, manifest_seq))) => {
+                info!(namespace = %name, manifest_seq, "loaded index from S3 manifest");
+                (Some(idx), Some(etag), manifest_seq)
             }
-            Ok(None) | Err(_) => {
-                let idx = self.build_index_from_documents(name, &meta, &documents)?;
-                (idx, None)
+            Ok(None) => {
+                info!(namespace = %name, "no manifest found — running without index");
+                (None, None, 0)
+            }
+            Err(e) => {
+                info!(namespace = %name, error = %e, "failed to load index — running without index");
+                (None, None, 0)
             }
         };
 
@@ -97,7 +101,7 @@ impl NamespaceManager {
             doc_sequences,
             index,
             manifest_etag,
-            indexed_up_to_seq: wal_sequence,
+            indexed_up_to_seq,
         };
 
         info!(
@@ -120,8 +124,7 @@ impl NamespaceManager {
     async fn try_load_index_from_s3(
         &self,
         name: &str,
-        wal_sequences: &[u64],
-    ) -> Result<Option<(SPFreshIndex, String)>, EngineError> {
+    ) -> Result<Option<(SPFreshIndex, String, u64)>, EngineError> {
         let (manifest, etag) = match self.store.read_index_manifest_with_etag(name).await? {
             Some((m, e)) => (m, e),
             None => return Ok(None),
@@ -148,7 +151,8 @@ impl NamespaceManager {
             }
         }
 
-        let mut index = SPFreshIndex::from_parts(
+        let manifest_seq = manifest.wal_sequence;
+        let index = SPFreshIndex::from_parts(
             manifest.config,
             hi,
             posting_store,
@@ -156,51 +160,7 @@ impl NamespaceManager {
             manifest.num_vectors as usize,
         );
 
-        let new_seqs: Vec<u64> = wal_sequences.iter()
-            .filter(|&&s| s > manifest.wal_sequence)
-            .copied()
-            .collect();
-
-        if !new_seqs.is_empty() {
-            info!(
-                namespace = %name,
-                catchup_entries = new_seqs.len(),
-                "replaying WAL entries after manifest"
-            );
-            for seq in &new_seqs {
-                if let Some(entry) = self.store.read_wal(name, *seq).await? {
-                    replay_into_index(&mut index, &entry);
-                }
-            }
-        }
-
-        Ok(Some((index, etag)))
-    }
-
-    fn build_index_from_documents(
-        &self,
-        name: &str,
-        meta: &NamespaceMetadata,
-        documents: &HashMap<u64, Document>,
-    ) -> Result<Option<SPFreshIndex>, EngineError> {
-        if let Some(dims) = meta.dimensions {
-            let config = SPFreshConfig {
-                dimensions: dims,
-                distance_metric: meta.distance_metric,
-                ..Default::default()
-            };
-            let idx = SPFreshIndex::new(config);
-            for doc in documents.values() {
-                if let Some(vec) = &doc.vector {
-                    idx.insert(doc.id, vec)
-                        .map_err(|e| EngineError::Validation(e.to_string()))?;
-                }
-            }
-            info!(namespace = %name, vectors = idx.len(), "rebuilt index from WAL");
-            Ok(Some(idx))
-        } else {
-            Ok(None)
-        }
+        Ok(Some((index, etag, manifest_seq)))
     }
 
     pub async fn create_namespace(
@@ -602,6 +562,57 @@ mod tests {
         mgr
     }
 
+    async fn build_and_persist_test_index(store: &crate::storage::ObjectStore, ns: &str) {
+        use crate::engine::index::VectorIndex;
+        use crate::engine::index::spfresh::PostingStore;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let meta = store.read_metadata(ns).await.unwrap().unwrap();
+        let sequences = store.list_wal_sequences(ns).await.unwrap();
+
+        let dims = meta.dimensions.unwrap();
+        let config = SPFreshConfig {
+            dimensions: dims,
+            distance_metric: meta.distance_metric,
+            ..Default::default()
+        };
+        let mut idx = SPFreshIndex::new(config);
+
+        let mut wal_seq = 0u64;
+        for seq in &sequences {
+            if let Some(entry) = store.read_wal(ns, *seq).await.unwrap() {
+                replay_into_index(&mut idx, &entry);
+                wal_seq = entry.sequence;
+            }
+        }
+
+        let hi = idx.head_index().read().unwrap();
+        for hid in 0..hi.next_id() {
+            if hi.is_active(hid) {
+                if let Some(posting) = idx.posting_store().get(hid) {
+                    store.write_posting(ns, hid, &posting).await.unwrap();
+                }
+            }
+        }
+        store.write_centroids(ns, &hi.to_file()).await.unwrap();
+        let vm = idx.version_map().read().unwrap();
+        store.write_version_map(ns, &vm.to_file()).await.unwrap();
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let manifest = IndexManifest {
+            version: 1,
+            wal_sequence: wal_seq,
+            config: idx.config().clone(),
+            active_centroids: hi.len() as u32,
+            num_vectors: idx.len() as u64,
+            created_at: now,
+        };
+        drop(hi);
+        drop(vm);
+
+        store.write_index_manifest(ns, &manifest).await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_upsert_queries_via_brute_force() {
         let mgr = test_manager().await;
@@ -772,11 +783,7 @@ mod tests {
             mgr.upsert("test", docs).await.unwrap();
         }
 
-        {
-            let mgr = NamespaceManager::new(store.clone());
-            mgr.init().await.unwrap();
-            mgr.persist_index("test").await.unwrap();
-        }
+        build_and_persist_test_index(&store, "test").await;
 
         let manifest = store.read_index_manifest("test").await.unwrap();
         assert!(manifest.is_some(), "manifest should exist after persist");
@@ -810,11 +817,7 @@ mod tests {
             mgr.upsert("test", docs).await.unwrap();
         }
 
-        {
-            let mgr = NamespaceManager::new(store.clone());
-            mgr.init().await.unwrap();
-            mgr.persist_index("test").await.unwrap();
-        }
+        build_and_persist_test_index(&store, "test").await;
 
         {
             let mgr2 = NamespaceManager::new(store.clone());
@@ -849,7 +852,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_incremental_wal_replay() {
+    async fn test_indexer_then_more_writes_hybrid() {
         let store = crate::storage::ObjectStore::in_memory();
 
         {
@@ -859,26 +862,25 @@ mod tests {
             mgr.upsert("test", docs).await.unwrap();
         }
 
-        {
-            let mgr = NamespaceManager::new(store.clone());
-            mgr.init().await.unwrap();
-            mgr.persist_index("test").await.unwrap();
+        build_and_persist_test_index(&store, "test").await;
 
-            let more_docs = make_docs(500, 200, 32);
-            mgr.upsert("test", more_docs).await.unwrap();
-        }
+        let mgr = NamespaceManager::new(store.clone());
+        mgr.init().await.unwrap();
 
-        {
-            let mgr2 = NamespaceManager::new(store.clone());
-            mgr2.init().await.unwrap();
+        let idx_len = mgr.index_len("test").await.unwrap();
+        assert_eq!(idx_len, 500, "index should have 500 vectors from manifest");
 
-            let idx_len = mgr2.index_len("test").await.unwrap();
-            assert_eq!(idx_len, 700, "index should have 700 vectors (500 persisted + 200 WAL replay), got {idx_len}");
-        }
+        let more_docs = make_docs(500, 200, 32);
+        let tail_query = more_docs[0].vector.clone().unwrap();
+        mgr.upsert("test", more_docs).await.unwrap();
+
+        let results = mgr.query("test", tail_query, 10, None, false).await.unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].id, 500, "tail doc 500 found via hybrid query");
     }
 
     #[tokio::test]
-    async fn test_no_manifest_falls_back_to_wal_rebuild() {
+    async fn test_no_manifest_runs_without_index() {
         let store = crate::storage::ObjectStore::in_memory();
 
         {
@@ -893,7 +895,12 @@ mod tests {
             mgr2.init().await.unwrap();
 
             let idx_len = mgr2.index_len("test").await.unwrap();
-            assert_eq!(idx_len, 300, "WAL rebuild should produce 300 vectors, got {idx_len}");
+            assert_eq!(idx_len, 0, "no manifest means no index");
+
+            let query = make_docs(0, 1, 32)[0].vector.clone().unwrap();
+            let results = mgr2.query("test", query, 10, None, false).await.unwrap();
+            assert!(!results.is_empty(), "brute-force should still return results");
+            assert_eq!(results[0].id, 0);
         }
     }
 
@@ -909,9 +916,10 @@ mod tests {
             mgr.upsert("test", docs).await.unwrap();
         }
 
+        build_and_persist_test_index(&store, "test").await;
+
         let mgr = NamespaceManager::new(store.clone());
         mgr.init().await.unwrap();
-        mgr.persist_index("test").await.unwrap();
 
         let tail_docs = make_docs(100, 50, dims);
         let tail_query = tail_docs[0].vector.clone().unwrap();
@@ -945,9 +953,10 @@ mod tests {
             mgr.upsert("test", indexed_docs).await.unwrap();
         }
 
+        build_and_persist_test_index(&store, "test").await;
+
         let mgr = NamespaceManager::new(store.clone());
         mgr.init().await.unwrap();
-        mgr.persist_index("test").await.unwrap();
         mgr.upsert("test", tail_docs).await.unwrap();
 
         let all_vectors: Vec<(u64, Vec<f32>)> = all_docs.iter()
@@ -988,11 +997,13 @@ mod tests {
             mgr.upsert("test", docs).await.unwrap();
         }
 
+        build_and_persist_test_index(&store, "test").await;
+
         let mgr = NamespaceManager::new(store.clone());
         mgr.init().await.unwrap();
 
         let idx_len = mgr.index_len("test").await.unwrap();
-        assert_eq!(idx_len, 200, "all docs should be in index after rebuild");
+        assert_eq!(idx_len, 200, "all docs should be in index from manifest");
 
         let query = make_docs(0, 1, dims)[0].vector.clone().unwrap();
         let results = mgr.query("test", query, 10, None, false).await.unwrap();
@@ -1012,9 +1023,10 @@ mod tests {
             mgr.upsert("test", docs).await.unwrap();
         }
 
+        build_and_persist_test_index(&store, "test").await;
+
         let mgr = NamespaceManager::new(store.clone());
         mgr.init().await.unwrap();
-        mgr.persist_index("test").await.unwrap();
 
         let tail_docs = make_docs(100, 50, dims);
         let tail_query = tail_docs[0].vector.clone().unwrap();
