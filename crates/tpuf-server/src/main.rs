@@ -25,6 +25,17 @@ async fn main() -> anyhow::Result<()> {
     mgr.init().await?;
     info!("WAL replay complete");
 
+    let reload_mgr = Arc::clone(&mgr);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            reload_mgr.reload_indexes_if_changed().await;
+        }
+    });
+    info!("index hot-reload enabled (30s interval)");
+
     let app = api::router().with_state(mgr);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;

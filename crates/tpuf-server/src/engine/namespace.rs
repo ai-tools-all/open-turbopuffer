@@ -506,6 +506,73 @@ impl NamespaceManager {
 
         Ok(query_results)
     }
+
+    pub async fn reload_indexes_if_changed(&self) {
+        let ns_names: Vec<String> = {
+            let ns = self.namespaces.read().await;
+            ns.keys().cloned().collect()
+        };
+
+        for name in ns_names {
+            if let Err(e) = self.try_reload_index(&name).await {
+                info!(namespace = %name, error = %e, "index reload check failed");
+            }
+        }
+    }
+
+    async fn try_reload_index(&self, name: &str) -> Result<(), EngineError> {
+        let current_etag = {
+            let namespaces = self.namespaces.read().await;
+            let ns_state = match namespaces.get(name) {
+                Some(s) => s.clone(),
+                None => return Ok(()),
+            };
+            let state = ns_state.read().await;
+            state.manifest_etag.clone()
+        };
+
+        let s3_etag = match self.store.read_index_manifest_with_etag(name).await? {
+            Some((_, etag)) => Some(etag),
+            None => None,
+        };
+
+        let changed = match (&current_etag, &s3_etag) {
+            (Some(cur), Some(s3)) => cur != s3,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+
+        if !changed {
+            return Ok(());
+        }
+
+        let (index, etag, manifest_seq) = match self.try_load_index_from_s3(name).await? {
+            Some(result) => result,
+            None => return Ok(()),
+        };
+
+        let namespaces = self.namespaces.read().await;
+        let ns_state = match namespaces.get(name) {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        let mut state = ns_state.write().await;
+
+        let old_seq = state.indexed_up_to_seq;
+        state.index = Some(index);
+        state.manifest_etag = Some(etag);
+        state.indexed_up_to_seq = manifest_seq;
+
+        info!(
+            namespace = %name,
+            old_seq,
+            new_seq = manifest_seq,
+            index_len = state.index.as_ref().map_or(0, |i| i.len()),
+            "hot-reloaded index from S3"
+        );
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
