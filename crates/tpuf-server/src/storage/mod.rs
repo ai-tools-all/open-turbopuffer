@@ -17,6 +17,8 @@ pub enum StorageError {
     Bincode(#[from] Box<bincode::ErrorKind>),
     #[error("zstd: {0}")]
     Zstd(#[from] std::io::Error),
+    #[error("write conflict: {0}")]
+    WriteConflict(String),
 }
 
 impl ObjectStore {
@@ -81,9 +83,22 @@ impl ObjectStore {
     }
 
     pub async fn write_wal(&self, ns: &str, entry: &WalEntry) -> Result<(), StorageError> {
+        let key = Self::wal_key(ns, entry.sequence);
         let data = Self::encode(entry)?;
-        self.op.write(&Self::wal_key(ns, entry.sequence), data).await?;
-        Ok(())
+        match self.op.write_with(&key, data).if_not_exists(true).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == opendal::ErrorKind::ConditionNotMatch => {
+                Err(StorageError::WriteConflict(
+                    format!("WAL entry {}/{} already exists", ns, entry.sequence)
+                ))
+            }
+            Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
+                let data = Self::encode(entry)?;
+                self.op.write(&key, data).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub async fn read_wal(&self, ns: &str, seq: u64) -> Result<Option<WalEntry>, StorageError> {
@@ -152,9 +167,60 @@ impl ObjectStore {
         Ok(())
     }
 
+    pub async fn write_index_manifest_cas(
+        &self,
+        ns: &str,
+        manifest: &IndexManifest,
+        prev_etag: Option<&str>,
+    ) -> Result<String, StorageError> {
+        let key = Self::index_manifest_key(ns);
+        let data = Self::encode(manifest)?;
+
+        let write_result = match prev_etag {
+            Some(etag) => {
+                self.op.write_with(&key, data).if_match(etag).await
+            }
+            None => {
+                self.op.write_with(&key, data).if_not_exists(true).await
+            }
+        };
+
+        match write_result {
+            Ok(()) => {}
+            Err(e) if e.kind() == opendal::ErrorKind::ConditionNotMatch => {
+                return Err(StorageError::WriteConflict(
+                    format!("manifest conflict for namespace '{}': another writer updated it", ns)
+                ));
+            }
+            Err(e) if e.kind() == opendal::ErrorKind::Unsupported => {
+                let data = Self::encode(manifest)?;
+                self.op.write(&key, data).await?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let meta = self.op.stat(&key).await?;
+        let etag = meta.etag().unwrap_or("").to_string();
+        Ok(etag)
+    }
+
     pub async fn read_index_manifest(&self, ns: &str) -> Result<Option<IndexManifest>, StorageError> {
         match self.op.read(&Self::index_manifest_key(ns)).await {
             Ok(data) => Ok(Some(Self::decode(&data.to_vec())?)),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn read_index_manifest_with_etag(&self, ns: &str) -> Result<Option<(IndexManifest, String)>, StorageError> {
+        let key = Self::index_manifest_key(ns);
+        match self.op.stat(&key).await {
+            Ok(meta) => {
+                let etag = meta.etag().unwrap_or("").to_string();
+                let data = self.op.read(&key).await?;
+                let manifest: IndexManifest = Self::decode(&data.to_vec())?;
+                Ok(Some((manifest, etag)))
+            }
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }

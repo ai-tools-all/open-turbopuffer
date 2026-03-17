@@ -1,0 +1,46 @@
+---
+title: "S3 Conditional Write Guards Implementation"
+date: 2026-03-17
+depends_on:
+  - docs/2026-02-12-18-58-08-s3-conditional-writes.md
+  - docs/2026-03-17-spfresh-s3-persistence.md
+beads_issue: ot-004
+status: in-progress
+---
+
+# S3 Conditional Write Guards — Progress
+
+Add If-None-Match and If-Match conditional writes as safety guards.
+Test against Cloudflare R2 (not local MinIO).
+
+## Phases
+
+### Phase 1: Add conditional write methods to ObjectStore
+- [x] Add `WriteConflict` variant to `StorageError`
+- [x] `write_wal()` now uses `if_not_exists(true)` — fails loudly on duplicate WAL entries
+- [x] Add `write_index_manifest_cas()` — uses `if_match(etag)` or `if_not_exists` for first write
+- [x] Add `read_index_manifest_with_etag()` — returns `(IndexManifest, String)` with ETag
+- [x] Falls back to unconditional write if backend doesn't support conditionals (Memory)
+
+### Phase 2: Wire CAS into persist_index
+- [x] Add `manifest_etag: Option<String>` to `NamespaceState`
+- [x] `persist_index()` uses CAS: first write uses `if_not_exists`, subsequent use `if_match(prev_etag)`
+- [x] `try_load_index_from_s3()` captures ETag from manifest read
+- [x] All 67 existing tests still pass ✓
+
+### Phase 3: Integration tests against Cloudflare R2
+- [ ] Create R2 ObjectStore from `.env.local.cf` credentials
+- [ ] Test: WAL exclusive write — write once succeeds, write same key again fails with WriteConflict
+- [ ] Test: Manifest CAS — read etag, write with if_match succeeds, stale etag fails
+- [ ] Test: Full persist_index roundtrip on R2
+- [ ] Cleanup: delete test prefix after tests
+
+---
+
+## Progress Log
+
+### Phases 1-2 — DONE
+- WAL writes use `if_not_exists(true)` to prevent duplicate sequence numbers
+- Manifest writes use CAS via `if_match(etag)` / `if_not_exists(true)`
+- Falls back gracefully on backends that don't support conditionals (Memory)
+- ETag tracked in NamespaceState, loaded from S3 manifest on startup

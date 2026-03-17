@@ -31,6 +31,7 @@ struct NamespaceState {
     metadata: NamespaceMetadata,
     documents: HashMap<u64, Document>,
     index: Option<SPFreshIndex>,
+    manifest_etag: Option<String>,
 }
 
 pub struct NamespaceManager {
@@ -72,13 +73,14 @@ impl NamespaceManager {
         let doc_count = documents.len() as u64;
         let wal_sequence = sequences.last().copied().unwrap_or(0);
 
-        let index = match self.try_load_index_from_s3(name, &sequences).await {
-            Ok(Some(idx)) => {
+        let (index, manifest_etag) = match self.try_load_index_from_s3(name, &sequences).await {
+            Ok(Some((idx, etag))) => {
                 info!(namespace = %name, "loaded index from S3 manifest");
-                Some(idx)
+                (Some(idx), Some(etag))
             }
             Ok(None) | Err(_) => {
-                self.build_index_from_documents(name, &meta, &documents)?
+                let idx = self.build_index_from_documents(name, &meta, &documents)?;
+                (idx, None)
             }
         };
 
@@ -90,6 +92,7 @@ impl NamespaceManager {
             },
             documents,
             index,
+            manifest_etag,
         };
 
         info!(
@@ -113,9 +116,9 @@ impl NamespaceManager {
         &self,
         name: &str,
         wal_sequences: &[u64],
-    ) -> Result<Option<SPFreshIndex>, EngineError> {
-        let manifest = match self.store.read_index_manifest(name).await? {
-            Some(m) => m,
+    ) -> Result<Option<(SPFreshIndex, String)>, EngineError> {
+        let (manifest, etag) = match self.store.read_index_manifest_with_etag(name).await? {
+            Some((m, e)) => (m, e),
             None => return Ok(None),
         };
 
@@ -166,7 +169,7 @@ impl NamespaceManager {
             }
         }
 
-        Ok(Some(index))
+        Ok(Some((index, etag)))
     }
 
     fn build_index_from_documents(
@@ -222,6 +225,7 @@ impl NamespaceManager {
             metadata: meta,
             documents: HashMap::new(),
             index: None,
+            manifest_etag: None,
         };
 
         let arc_state = Arc::new(RwLock::new(state));
@@ -394,38 +398,44 @@ impl NamespaceManager {
                 .ok_or_else(|| EngineError::NotFound(ns.to_string()))?
                 .clone()
         };
-        let state = ns_state.read().await;
+        let mut state = ns_state.write().await;
 
-        let index = match &state.index {
-            Some(i) => i,
-            None => return Ok(()),
-        };
+        let (manifest, prev_etag) = {
+            let index = match &state.index {
+                Some(i) => i,
+                None => return Ok(()),
+            };
 
-        let hi = index.head_index().read().unwrap();
+            let hi = index.head_index().read().unwrap();
 
-        for hid in 0..hi.next_id() {
-            if hi.is_active(hid) {
-                if let Some(posting) = index.posting_store().get(hid) {
-                    self.store.write_posting(ns, hid, &posting).await?;
+            for hid in 0..hi.next_id() {
+                if hi.is_active(hid) {
+                    if let Some(posting) = index.posting_store().get(hid) {
+                        self.store.write_posting(ns, hid, &posting).await?;
+                    }
                 }
             }
-        }
 
-        self.store.write_centroids(ns, &hi.to_file()).await?;
+            self.store.write_centroids(ns, &hi.to_file()).await?;
 
-        let vm = index.version_map().read().unwrap();
-        self.store.write_version_map(ns, &vm.to_file()).await?;
+            let vm = index.version_map().read().unwrap();
+            self.store.write_version_map(ns, &vm.to_file()).await?;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        let manifest = IndexManifest {
-            version: 1,
-            wal_sequence: state.metadata.wal_sequence,
-            config: index.config().clone(),
-            active_centroids: hi.len() as u32,
-            num_vectors: index.len() as u64,
-            created_at: now,
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            let manifest = IndexManifest {
+                version: 1,
+                wal_sequence: state.metadata.wal_sequence,
+                config: index.config().clone(),
+                active_centroids: hi.len() as u32,
+                num_vectors: index.len() as u64,
+                created_at: now,
+            };
+            let prev_etag = state.manifest_etag.clone();
+            (manifest, prev_etag)
         };
-        self.store.write_index_manifest(ns, &manifest).await?;
+
+        let new_etag = self.store.write_index_manifest_cas(ns, &manifest, prev_etag.as_deref()).await?;
+        state.manifest_etag = Some(new_etag);
 
         info!(
             namespace = %ns,
