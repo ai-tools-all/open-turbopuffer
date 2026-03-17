@@ -4,7 +4,7 @@ date: 2026-03-17
 depends_on:
   - docs/2026-02-26-14-32-07-spfresh-wiring-and-s3-centroids.md
   - docs/2026-03-17-spfresh-wiring-implementation.md
-status: in-progress
+status: done
 ---
 
 # SPFresh S3 Index Persistence — Progress
@@ -40,12 +40,12 @@ Covers Steps 4-7 from the parent design doc.
 - [x] Test: `test_persist_index` — upsert 200, persist, verify manifest/centroids/version_map exist ✓
 
 ### Phase 7: load_index from S3 on startup (with WAL catch-up)
-- [ ] Modify `load_namespace()` to try loading index from S3 manifest
-- [ ] Implement WAL catch-up for entries after manifest's wal_sequence
-- [ ] Fall back to WAL rebuild if manifest missing or corrupt
-- [ ] Test: `test_persist_and_load_roundtrip` — upsert → persist → reload → recall > 0.85
-- [ ] Test: `test_incremental_wal_replay` — persist at seq N, add more, reload catches up
-- [ ] Test: `test_no_manifest_falls_back_to_wal_rebuild` — no manifest → full WAL rebuild works
+- [x] Modify `load_namespace()` to try loading index from S3 manifest
+- [x] Implement WAL catch-up for entries after manifest's wal_sequence
+- [x] Fall back to WAL rebuild if manifest missing or corrupt
+- [x] Test: `test_persist_and_load_roundtrip` — 1000 vecs, persist, reload, recall@10 = 1.0 ✓
+- [x] Test: `test_incremental_wal_replay` — persist 500, add 200 more, reload has 700 ✓
+- [x] Test: `test_no_manifest_falls_back_to_wal_rebuild` — no manifest, WAL rebuild gives 300 ✓
 
 ---
 
@@ -67,3 +67,10 @@ Covers Steps 4-7 from the parent design doc.
 - `persist_index()` writes postings → centroids → version_map → manifest (manifest-last)
 - If crash before manifest write, startup ignores partial data
 - 1 new test passes, all 64 tests green
+
+### Phase 7 — DONE
+- `load_namespace()` tries S3 manifest first, falls back to WAL rebuild
+- `try_load_index_from_s3()` loads centroids, postings, version_map from S3
+- WAL catch-up replays entries after manifest's `wal_sequence`
+- `replay_into_index()` feeds WAL ops into a loaded index
+- 3 new tests pass (roundtrip recall=1.0, incremental WAL, fallback), all 67 tests green

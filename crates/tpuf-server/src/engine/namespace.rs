@@ -9,7 +9,7 @@ use crate::types::*;
 use super::search::brute_force_knn;
 use super::batcher::WriteBatcher;
 use super::index::VectorIndex;
-use super::index::spfresh::{SPFreshIndex, SPFreshConfig, PostingStore};
+use super::index::spfresh::{SPFreshIndex, SPFreshConfig, PostingStore, HeadIndex, MemoryPostingStore, VersionMap};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -72,22 +72,14 @@ impl NamespaceManager {
         let doc_count = documents.len() as u64;
         let wal_sequence = sequences.last().copied().unwrap_or(0);
 
-        let index = if let Some(dims) = meta.dimensions {
-            let config = SPFreshConfig {
-                dimensions: dims,
-                distance_metric: meta.distance_metric,
-                ..Default::default()
-            };
-            let idx = SPFreshIndex::new(config);
-            for doc in documents.values() {
-                if let Some(vec) = &doc.vector {
-                    idx.insert(doc.id, vec)
-                        .map_err(|e| EngineError::Validation(e.to_string()))?;
-                }
+        let index = match self.try_load_index_from_s3(name, &sequences).await {
+            Ok(Some(idx)) => {
+                info!(namespace = %name, "loaded index from S3 manifest");
+                Some(idx)
             }
-            Some(idx)
-        } else {
-            None
+            Ok(None) | Err(_) => {
+                self.build_index_from_documents(name, &meta, &documents)?
+            }
         };
 
         let state = NamespaceState {
@@ -104,6 +96,7 @@ impl NamespaceManager {
             namespace = %name,
             docs = doc_count,
             wal_entries = sequences.len(),
+            index_len = state.index.as_ref().map_or(0, |i| i.len()),
             "namespace loaded"
         );
 
@@ -114,6 +107,92 @@ impl NamespaceManager {
         self.batchers.write().await.insert(name.to_string(), batcher);
 
         Ok(())
+    }
+
+    async fn try_load_index_from_s3(
+        &self,
+        name: &str,
+        wal_sequences: &[u64],
+    ) -> Result<Option<SPFreshIndex>, EngineError> {
+        let manifest = match self.store.read_index_manifest(name).await? {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        let centroids_file = match self.store.read_centroids(name).await? {
+            Some(cf) => cf,
+            None => return Ok(None),
+        };
+        let vmap_file = match self.store.read_version_map(name).await? {
+            Some(vf) => vf,
+            None => return Ok(None),
+        };
+
+        let hi = HeadIndex::from_file(centroids_file);
+        let vm = VersionMap::from_file(vmap_file);
+        let posting_store = MemoryPostingStore::new();
+
+        for hid in 0..hi.next_id() {
+            if hi.is_active(hid) {
+                if let Some(pl) = self.store.read_posting(name, hid).await? {
+                    posting_store.put(hid, pl);
+                }
+            }
+        }
+
+        let mut index = SPFreshIndex::from_parts(
+            manifest.config,
+            hi,
+            posting_store,
+            vm,
+            manifest.num_vectors as usize,
+        );
+
+        let new_seqs: Vec<u64> = wal_sequences.iter()
+            .filter(|&&s| s > manifest.wal_sequence)
+            .copied()
+            .collect();
+
+        if !new_seqs.is_empty() {
+            info!(
+                namespace = %name,
+                catchup_entries = new_seqs.len(),
+                "replaying WAL entries after manifest"
+            );
+            for seq in &new_seqs {
+                if let Some(entry) = self.store.read_wal(name, *seq).await? {
+                    replay_into_index(&mut index, &entry);
+                }
+            }
+        }
+
+        Ok(Some(index))
+    }
+
+    fn build_index_from_documents(
+        &self,
+        name: &str,
+        meta: &NamespaceMetadata,
+        documents: &HashMap<u64, Document>,
+    ) -> Result<Option<SPFreshIndex>, EngineError> {
+        if let Some(dims) = meta.dimensions {
+            let config = SPFreshConfig {
+                dimensions: dims,
+                distance_metric: meta.distance_metric,
+                ..Default::default()
+            };
+            let idx = SPFreshIndex::new(config);
+            for doc in documents.values() {
+                if let Some(vec) = &doc.vector {
+                    idx.insert(doc.id, vec)
+                        .map_err(|e| EngineError::Validation(e.to_string()))?;
+                }
+            }
+            info!(namespace = %name, vectors = idx.len(), "rebuilt index from WAL");
+            Ok(Some(idx))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn create_namespace(
@@ -439,6 +518,25 @@ pub struct QueryResult {
     pub attributes: HashMap<String, AttributeValue>,
 }
 
+fn replay_into_index(index: &mut SPFreshIndex, entry: &WalEntry) {
+    for op in &entry.operations {
+        match op {
+            WriteOp::Upsert(docs) => {
+                for doc in docs {
+                    if let Some(vec) = &doc.vector {
+                        let _ = index.insert(doc.id, vec);
+                    }
+                }
+            }
+            WriteOp::Delete(ids) => {
+                for &id in ids {
+                    let _ = index.delete(id);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn apply_wal_entry(documents: &mut HashMap<u64, Document>, entry: &WalEntry) {
     for op in &entry.operations {
         match op {
@@ -664,5 +762,101 @@ mod tests {
 
         let vmap = store.read_version_map("test").await.unwrap();
         assert!(vmap.is_some(), "version_map file should exist");
+    }
+
+    #[tokio::test]
+    async fn test_persist_and_load_roundtrip() {
+        use crate::engine::search::brute_force_knn;
+
+        let dims = 32;
+        let k = 10;
+        let store = crate::storage::ObjectStore::in_memory();
+
+        let docs = make_docs(0, 1000, dims);
+        let vectors: Vec<Vec<f32>> = docs.iter()
+            .map(|d| d.vector.clone().unwrap())
+            .collect();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            mgr.upsert("test", docs).await.unwrap();
+            mgr.persist_index("test").await.unwrap();
+        }
+
+        {
+            let mgr2 = NamespaceManager::new(store.clone());
+            mgr2.init().await.unwrap();
+
+            let idx_len = mgr2.index_len("test").await.unwrap();
+            assert_eq!(idx_len, 1000, "loaded index should have 1000 vectors, got {idx_len}");
+
+            let queries = make_docs(2000, 20, dims);
+            let indexed: Vec<(u64, &[f32])> = vectors.iter()
+                .enumerate()
+                .map(|(i, v)| (i as u64, v.as_slice()))
+                .collect();
+
+            let mut total_recall = 0.0;
+            for q_doc in &queries {
+                let qv = q_doc.vector.as_ref().unwrap();
+                let gt = brute_force_knn(qv, &indexed, DistanceMetric::EuclideanSquared, k);
+                let gt_ids: std::collections::HashSet<u64> = gt.iter().map(|(id, _)| *id).collect();
+
+                let results = mgr2.query("test", qv.clone(), k, None, false).await.unwrap();
+                let result_ids: std::collections::HashSet<u64> = results.iter().map(|r| r.id).collect();
+
+                let overlap = gt_ids.intersection(&result_ids).count();
+                total_recall += overlap as f64 / k as f64;
+            }
+
+            let avg_recall = total_recall / 20.0;
+            println!("Persist-load recall@{k}: {avg_recall:.4}");
+            assert!(avg_recall > 0.85, "Persist-load recall@{k} = {avg_recall:.4}, expected > 0.85");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_incremental_wal_replay() {
+        let store = crate::storage::ObjectStore::in_memory();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 500, 32);
+            mgr.upsert("test", docs).await.unwrap();
+            mgr.persist_index("test").await.unwrap();
+
+            let more_docs = make_docs(500, 200, 32);
+            mgr.upsert("test", more_docs).await.unwrap();
+        }
+
+        {
+            let mgr2 = NamespaceManager::new(store.clone());
+            mgr2.init().await.unwrap();
+
+            let idx_len = mgr2.index_len("test").await.unwrap();
+            assert_eq!(idx_len, 700, "index should have 700 vectors (500 persisted + 200 WAL replay), got {idx_len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_no_manifest_falls_back_to_wal_rebuild() {
+        let store = crate::storage::ObjectStore::in_memory();
+
+        {
+            let mgr = NamespaceManager::new(store.clone());
+            mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
+            let docs = make_docs(0, 300, 32);
+            mgr.upsert("test", docs).await.unwrap();
+        }
+
+        {
+            let mgr2 = NamespaceManager::new(store.clone());
+            mgr2.init().await.unwrap();
+
+            let idx_len = mgr2.index_len("test").await.unwrap();
+            assert_eq!(idx_len, 300, "WAL rebuild should produce 300 vectors, got {idx_len}");
+        }
     }
 }
