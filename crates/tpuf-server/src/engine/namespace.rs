@@ -4,12 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::info;
 
-use crate::storage::ObjectStore;
+use crate::storage::{ObjectStore, CacheConfig, CachedPostingStore};
 use crate::types::*;
 use super::search::{brute_force_knn, merge_top_k};
 use super::batcher::WriteBatcher;
-use super::index::VectorIndex;
-use super::index::spfresh::{SPFreshIndex, SPFreshConfig, PostingStore, HeadIndex, MemoryPostingStore, VersionMap};
+use super::index::spfresh::{SPFreshIndex, SPFreshConfig, HeadIndex, VersionMap};
+use super::index::spfresh::search::search_postings;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -27,25 +27,48 @@ pub enum EngineError {
     Validation(String),
 }
 
+struct IndexState {
+    head_index: HeadIndex,
+    version_map: VersionMap,
+    config: SPFreshConfig,
+    num_vectors: u64,
+}
+
 struct NamespaceState {
     metadata: NamespaceMetadata,
     documents: HashMap<u64, Document>,
     doc_sequences: HashMap<u64, u64>,
-    index: Option<SPFreshIndex>,
+    index: Option<IndexState>,
     manifest_etag: Option<String>,
     indexed_up_to_seq: u64,
 }
 
 pub struct NamespaceManager {
     store: ObjectStore,
+    posting_cache: CachedPostingStore,
     namespaces: RwLock<HashMap<String, Arc<RwLock<NamespaceState>>>>,
     batchers: RwLock<HashMap<String, Arc<WriteBatcher>>>,
 }
 
 impl NamespaceManager {
-    pub fn new(store: ObjectStore) -> Self {
+    pub async fn with_cache(store: ObjectStore, cache_config: &CacheConfig) -> anyhow::Result<Self> {
+        let posting_cache = CachedPostingStore::new(store.clone(), cache_config).await?;
+        Ok(Self {
+            store,
+            posting_cache,
+            namespaces: RwLock::new(HashMap::new()),
+            batchers: RwLock::new(HashMap::new()),
+        })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn new(store: ObjectStore) -> Self {
+        let posting_cache = CachedPostingStore::new_memory_only(store.clone(), 64 * 1024 * 1024)
+            .await
+            .expect("failed to create memory-only posting cache");
         Self {
             store,
+            posting_cache,
             namespaces: RwLock::new(HashMap::new()),
             batchers: RwLock::new(HashMap::new()),
         }
@@ -77,9 +100,9 @@ impl NamespaceManager {
         let wal_sequence = sequences.last().copied().unwrap_or(0);
 
         let (index, manifest_etag, indexed_up_to_seq) = match self.try_load_index_from_s3(name).await {
-            Ok(Some((idx, etag, manifest_seq))) => {
-                info!(namespace = %name, manifest_seq, "loaded index from S3 manifest");
-                (Some(idx), Some(etag), manifest_seq)
+            Ok(Some((idx_state, etag, manifest_seq))) => {
+                info!(namespace = %name, manifest_seq, num_vectors = idx_state.num_vectors, "loaded index from S3 manifest");
+                (Some(idx_state), Some(etag), manifest_seq)
             }
             Ok(None) => {
                 info!(namespace = %name, "no manifest found — running without index");
@@ -108,7 +131,7 @@ impl NamespaceManager {
             namespace = %name,
             docs = doc_count,
             wal_entries = sequences.len(),
-            index_len = state.index.as_ref().map_or(0, |i| i.len()),
+            index_vectors = state.index.as_ref().map_or(0, |i| i.num_vectors),
             "namespace loaded"
         );
 
@@ -124,7 +147,7 @@ impl NamespaceManager {
     async fn try_load_index_from_s3(
         &self,
         name: &str,
-    ) -> Result<Option<(SPFreshIndex, String, u64)>, EngineError> {
+    ) -> Result<Option<(IndexState, String, u64)>, EngineError> {
         let (manifest, etag) = match self.store.read_index_manifest_with_etag(name).await? {
             Some((m, e)) => (m, e),
             None => return Ok(None),
@@ -141,26 +164,16 @@ impl NamespaceManager {
 
         let hi = HeadIndex::from_file(centroids_file);
         let vm = VersionMap::from_file(vmap_file);
-        let posting_store = MemoryPostingStore::new();
-
-        for hid in 0..hi.next_id() {
-            if hi.is_active(hid) {
-                if let Some(pl) = self.store.read_posting(name, hid).await? {
-                    posting_store.put(hid, pl);
-                }
-            }
-        }
-
         let manifest_seq = manifest.wal_sequence;
-        let index = SPFreshIndex::from_parts(
-            manifest.config,
-            hi,
-            posting_store,
-            vm,
-            manifest.num_vectors as usize,
-        );
 
-        Ok(Some((index, etag, manifest_seq)))
+        let index_state = IndexState {
+            head_index: hi,
+            version_map: vm,
+            config: manifest.config,
+            num_vectors: manifest.num_vectors,
+        };
+
+        Ok(Some((index_state, etag, manifest_seq)))
     }
 
     pub async fn create_namespace(
@@ -330,49 +343,62 @@ impl NamespaceManager {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn persist_index(&self, ns: &str) -> Result<(), EngineError> {
+        use super::index::VectorIndex;
+        use super::index::spfresh::PostingStore;
+
         let ns_state = {
             let namespaces = self.namespaces.read().await;
             namespaces.get(ns)
                 .ok_or_else(|| EngineError::NotFound(ns.to_string()))?
                 .clone()
         };
-        let mut state = ns_state.write().await;
+        let state = ns_state.read().await;
 
-        let (manifest, prev_etag) = {
-            let index = match &state.index {
-                Some(i) => i,
-                None => return Ok(()),
-            };
+        let dims = state.metadata.dimensions.unwrap_or(0);
+        let config = state.index.as_ref()
+            .map(|idx| idx.config.clone())
+            .unwrap_or_else(|| SPFreshConfig {
+                dimensions: dims,
+                distance_metric: state.metadata.distance_metric,
+                ..Default::default()
+            });
 
-            let hi = index.head_index().read().unwrap();
+        let idx = SPFreshIndex::new(config);
+        for doc in state.documents.values() {
+            if let Some(vec) = &doc.vector {
+                let _ = idx.insert(doc.id, vec);
+            }
+        }
 
-            for hid in 0..hi.next_id() {
-                if hi.is_active(hid) {
-                    if let Some(posting) = index.posting_store().get(hid) {
-                        self.store.write_posting(ns, hid, &posting).await?;
-                    }
+        let hi = idx.head_index().read().unwrap();
+        for hid in 0..hi.next_id() {
+            if hi.is_active(hid) {
+                if let Some(posting) = idx.posting_store().get(hid) {
+                    self.store.write_posting(ns, hid, &posting).await?;
                 }
             }
+        }
+        self.store.write_centroids(ns, &hi.to_file()).await?;
+        let vm = idx.version_map().read().unwrap();
+        self.store.write_version_map(ns, &vm.to_file()).await?;
 
-            self.store.write_centroids(ns, &hi.to_file()).await?;
-
-            let vm = index.version_map().read().unwrap();
-            self.store.write_version_map(ns, &vm.to_file()).await?;
-
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-            let manifest = IndexManifest {
-                version: 1,
-                wal_sequence: state.metadata.wal_sequence,
-                config: index.config().clone(),
-                active_centroids: hi.len() as u32,
-                num_vectors: index.len() as u64,
-                created_at: now,
-            };
-            let prev_etag = state.manifest_etag.clone();
-            (manifest, prev_etag)
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        let manifest = IndexManifest {
+            version: 1,
+            wal_sequence: state.metadata.wal_sequence,
+            config: idx.config().clone(),
+            active_centroids: hi.len() as u32,
+            num_vectors: idx.len() as u64,
+            created_at: now,
         };
+        drop(hi);
+        drop(vm);
+        drop(state);
 
+        let mut state = ns_state.write().await;
+        let prev_etag = state.manifest_etag.clone();
         let new_etag = self.store.write_index_manifest_cas(ns, &manifest, prev_etag.as_deref()).await?;
         state.manifest_etag = Some(new_etag);
 
@@ -392,7 +418,7 @@ impl NamespaceManager {
         let ns_state = namespaces.get(ns)
             .ok_or_else(|| EngineError::NotFound(ns.to_string()))?;
         let state = ns_state.read().await;
-        Ok(state.index.as_ref().map_or(0, |idx| idx.len()))
+        Ok(state.index.as_ref().map_or(0, |idx| idx.num_vectors as usize))
     }
 
     pub async fn get_document(&self, ns: &str, id: u64) -> Result<Option<Document>, EngineError> {
@@ -427,10 +453,16 @@ impl NamespaceManager {
 
         let metric = distance_metric.unwrap_or(state.metadata.distance_metric);
 
-        let scored = if let Some(index) = &state.index {
-            let ann_results = if index.len() > 0 {
-                index.search(&vector, top_k)
-                    .map_err(|e| EngineError::Validation(e.to_string()))?
+        let scored = if let Some(idx_state) = &state.index {
+            let ann_results = if idx_state.num_vectors > 0 {
+                let head_ids: Vec<u32> = idx_state.head_index
+                    .search(&vector, idx_state.config.num_search_heads, idx_state.config.distance_metric)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+
+                let postings = self.posting_cache.get_multi(ns, &head_ids).await;
+                search_postings(&vector, &postings, &idx_state.version_map, idx_state.config.distance_metric, top_k)
             } else {
                 Vec::new()
             };
@@ -546,7 +578,7 @@ impl NamespaceManager {
             return Ok(());
         }
 
-        let (index, etag, manifest_seq) = match self.try_load_index_from_s3(name).await? {
+        let (idx_state, etag, manifest_seq) = match self.try_load_index_from_s3(name).await? {
             Some(result) => result,
             None => return Ok(()),
         };
@@ -559,7 +591,8 @@ impl NamespaceManager {
         let mut state = ns_state.write().await;
 
         let old_seq = state.indexed_up_to_seq;
-        state.index = Some(index);
+        let num_vectors = idx_state.num_vectors;
+        state.index = Some(idx_state);
         state.manifest_etag = Some(etag);
         state.indexed_up_to_seq = manifest_seq;
 
@@ -567,7 +600,7 @@ impl NamespaceManager {
             namespace = %name,
             old_seq,
             new_seq = manifest_seq,
-            index_len = state.index.as_ref().map_or(0, |i| i.len()),
+            num_vectors,
             "hot-reloaded index from S3"
         );
 
@@ -585,6 +618,7 @@ pub struct QueryResult {
 }
 
 pub fn replay_into_index(index: &mut SPFreshIndex, entry: &WalEntry) {
+    use super::index::VectorIndex;
     for op in &entry.operations {
         match op {
             WriteOp::Upsert(docs) => {
@@ -654,7 +688,7 @@ mod tests {
 
     async fn test_manager() -> NamespaceManager {
         let store = crate::storage::ObjectStore::in_memory();
-        let mgr = NamespaceManager::new(store);
+        let mgr = NamespaceManager::new(store).await;
         mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
         mgr
     }
@@ -771,7 +805,7 @@ mod tests {
     #[tokio::test]
     async fn test_fallback_to_brute_force_empty() {
         let store = crate::storage::ObjectStore::in_memory();
-        let mgr = NamespaceManager::new(store);
+        let mgr = NamespaceManager::new(store).await;
         mgr.create_namespace("empty".into(), DistanceMetric::EuclideanSquared).await.unwrap();
 
         let q = vec![0.0f32; 32];
@@ -874,7 +908,7 @@ mod tests {
         let store = crate::storage::ObjectStore::in_memory();
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             let docs = make_docs(0, 200, 32);
             mgr.upsert("test", docs).await.unwrap();
@@ -909,7 +943,7 @@ mod tests {
             .collect();
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             mgr.upsert("test", docs).await.unwrap();
         }
@@ -917,7 +951,7 @@ mod tests {
         build_and_persist_test_index(&store, "test").await;
 
         {
-            let mgr2 = NamespaceManager::new(store.clone());
+            let mgr2 = NamespaceManager::new(store.clone()).await;
             mgr2.init().await.unwrap();
 
             let idx_len = mgr2.index_len("test").await.unwrap();
@@ -953,7 +987,7 @@ mod tests {
         let store = crate::storage::ObjectStore::in_memory();
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             let docs = make_docs(0, 500, 32);
             mgr.upsert("test", docs).await.unwrap();
@@ -961,7 +995,7 @@ mod tests {
 
         build_and_persist_test_index(&store, "test").await;
 
-        let mgr = NamespaceManager::new(store.clone());
+        let mgr = NamespaceManager::new(store.clone()).await;
         mgr.init().await.unwrap();
 
         let idx_len = mgr.index_len("test").await.unwrap();
@@ -981,14 +1015,14 @@ mod tests {
         let store = crate::storage::ObjectStore::in_memory();
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             let docs = make_docs(0, 300, 32);
             mgr.upsert("test", docs).await.unwrap();
         }
 
         {
-            let mgr2 = NamespaceManager::new(store.clone());
+            let mgr2 = NamespaceManager::new(store.clone()).await;
             mgr2.init().await.unwrap();
 
             let idx_len = mgr2.index_len("test").await.unwrap();
@@ -1007,7 +1041,7 @@ mod tests {
         let dims = 32;
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             let docs = make_docs(0, 100, dims);
             mgr.upsert("test", docs).await.unwrap();
@@ -1015,7 +1049,7 @@ mod tests {
 
         build_and_persist_test_index(&store, "test").await;
 
-        let mgr = NamespaceManager::new(store.clone());
+        let mgr = NamespaceManager::new(store.clone()).await;
         mgr.init().await.unwrap();
 
         let tail_docs = make_docs(100, 50, dims);
@@ -1045,14 +1079,14 @@ mod tests {
         let tail_docs: Vec<Document> = all_docs[1000..].to_vec();
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             mgr.upsert("test", indexed_docs).await.unwrap();
         }
 
         build_and_persist_test_index(&store, "test").await;
 
-        let mgr = NamespaceManager::new(store.clone());
+        let mgr = NamespaceManager::new(store.clone()).await;
         mgr.init().await.unwrap();
         mgr.upsert("test", tail_docs).await.unwrap();
 
@@ -1088,7 +1122,7 @@ mod tests {
         let dims = 32;
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             let docs = make_docs(0, 200, dims);
             mgr.upsert("test", docs).await.unwrap();
@@ -1096,7 +1130,7 @@ mod tests {
 
         build_and_persist_test_index(&store, "test").await;
 
-        let mgr = NamespaceManager::new(store.clone());
+        let mgr = NamespaceManager::new(store.clone()).await;
         mgr.init().await.unwrap();
 
         let idx_len = mgr.index_len("test").await.unwrap();
@@ -1114,7 +1148,7 @@ mod tests {
         let dims = 32;
 
         {
-            let mgr = NamespaceManager::new(store.clone());
+            let mgr = NamespaceManager::new(store.clone()).await;
             mgr.create_namespace("test".into(), DistanceMetric::EuclideanSquared).await.unwrap();
             let docs = make_docs(0, 100, dims);
             mgr.upsert("test", docs).await.unwrap();
@@ -1122,7 +1156,7 @@ mod tests {
 
         build_and_persist_test_index(&store, "test").await;
 
-        let mgr = NamespaceManager::new(store.clone());
+        let mgr = NamespaceManager::new(store.clone()).await;
         mgr.init().await.unwrap();
 
         let tail_docs = make_docs(100, 50, dims);

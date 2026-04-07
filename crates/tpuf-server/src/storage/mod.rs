@@ -1,8 +1,12 @@
+pub mod cache;
+
 use opendal::{Operator, services::S3};
 use std::sync::Arc;
 use tracing::debug;
 use crate::types::{NamespaceMetadata, WalEntry, IndexManifest};
 use crate::engine::index::spfresh::{CentroidsFile, VersionMapFile, PostingList};
+
+pub use cache::{CacheConfig, CachedPostingStore, SharedPostingCache};
 
 #[derive(Clone)]
 pub struct ObjectStore {
@@ -462,7 +466,7 @@ mod tests {
         let ns = r2_test_ns();
         let ns_name = ns.clone();
 
-        let mgr = NamespaceManager::new(store.clone());
+        let mgr = NamespaceManager::new(store.clone()).await;
         mgr.create_namespace(ns_name.clone(), DistanceMetric::EuclideanSquared).await.unwrap();
 
         let docs: Vec<crate::types::Document> = (0..50u64).map(|i| {

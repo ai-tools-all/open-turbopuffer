@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::path::PathBuf;
 use tracing::info;
 use tpuf_server::{api, engine, storage};
 
@@ -18,8 +19,18 @@ async fn main() -> anyhow::Result<()> {
     let region = std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into());
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3000);
 
+    let cache_dir = std::env::var("CACHE_DIR").unwrap_or_else(|_| "/tmp/tpuf-cache".into());
+    let cache_memory_mb: usize = std::env::var("CACHE_MEMORY_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+    let cache_disk_mb: usize = std::env::var("CACHE_DISK_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+
+    let cache_config = storage::CacheConfig {
+        dir: PathBuf::from(cache_dir),
+        memory_capacity: cache_memory_mb * 1024 * 1024,
+        disk_capacity: cache_disk_mb * 1024 * 1024,
+    };
+
     let store = storage::ObjectStore::new(&endpoint, &bucket, &access_key, &secret_key, &region)?;
-    let mgr = Arc::new(engine::NamespaceManager::new(store));
+    let mgr = Arc::new(engine::NamespaceManager::with_cache(store, &cache_config).await?);
 
     info!("replaying WAL from S3...");
     mgr.init().await?;

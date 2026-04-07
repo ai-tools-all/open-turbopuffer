@@ -266,7 +266,7 @@ mod tests {
         let ns = "load-test";
         let dims = 32;
 
-        let mgr = NamespaceManager::new(store.clone());
+        let mgr = NamespaceManager::new(store.clone()).await;
         mgr.create_namespace(ns.to_string(), DistanceMetric::EuclideanSquared).await.unwrap();
         let docs = make_docs(0, 500, dims);
         let query_vec = docs[0].vector.clone().unwrap();
@@ -275,7 +275,7 @@ mod tests {
 
         run_indexer(&store, ns).await.unwrap();
 
-        let mgr2 = NamespaceManager::new(store.clone());
+        let mgr2 = NamespaceManager::new(store.clone()).await;
         mgr2.init().await.unwrap();
 
         let idx_len = mgr2.index_len(ns).await.unwrap();

@@ -21,6 +21,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 bytes = "1"
 anyhow = "1"
+foyer = { version = "0.22.3", features = ["serde"] }
 
 [dev-dependencies]
 rand = "0.8"
